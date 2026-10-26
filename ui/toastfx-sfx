@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""toastfx-sfx: play soundboard clips into ToastFX's virtual mic through PipeWire.
+
+  toastfx-sfx play NAME|FILE    play a clip (also to your headphones if "hear it myself" is on)
+  toastfx-sfx stop              stop every clip that is playing
+  toastfx-sfx list              show the library
+  toastfx-sfx add FILE [NAME]   add a clip to the library
+  toastfx-sfx test              play two test tones, one after the other overlapping
+"""
+import hashlib
+import math
+import struct
+import subprocess
+import sys
+import time
+import wave
+from pathlib import Path
+
+from toastfx_common import *
+
+NATIVE = {".wav", ".flac", ".ogg", ".oga"}
+DEVNULL = subprocess.DEVNULL
+
+
+def die(msg):
+    print("toastfx-sfx:", msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def playable(path):
+    """Return a file pw-play can read, converting with ffmpeg (cached) when needed."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        die(f"file not found: {p}")
+    if p.suffix.lower() in NATIVE:
+        return p
+    CACHE.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(f"{p.resolve()}:{p.stat().st_mtime_ns}".encode()).hexdigest()[:16]
+    out = CACHE / f"{key}.wav"
+    if not out.exists():
+        try:
+            r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(p), "-ar", "48000", "-ac", "2",
+                                "-c:a", "pcm_s16le", str(out)], capture_output=True)
+        except FileNotFoundError:
+            die("ffmpeg is needed to play this file type (sudo apt install ffmpeg)")
+        if r.returncode:
+            out.unlink(missing_ok=True)
+            die("ffmpeg could not read that file: " + r.stderr.decode(errors="replace")[:200])
+    return out
+
+
+def spawn(file, name, target, volume):
+    cmd = ["pw-play"]
+    if target:
+        cmd += ["--target", target]
+    cmd += ["--volume", f"{volume:.2f}", str(file)]
+    try:
+        proc = subprocess.Popen(cmd, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
+    except FileNotFoundError:
+        die("pw-play not found (it comes with the pipewire-bin package)")
+    PLAYING.mkdir(parents=True, exist_ok=True)
+    (PLAYING / str(proc.pid)).write_text(name)
+    return proc
+
+
+def lookup(arg):
+    for s in load_library():
+        if s["name"].lower() == arg.lower():
+            return s["name"], s["path"]
+    if Path(arg).expanduser().is_file():
+        return Path(arg).stem, arg
+    die(f"no sound called '{arg}' (try: toastfx-sfx list)")
+
+
+def cmd_play(arg):
+    name, path = lookup(arg)
+    cfg = load_config()
+    f = playable(path)
+    vol = max(0.0, min(1.0, float(cfg.get("volume", 0.7))))
+    spawn(f, name, SINK, vol)
+    if cfg.get("monitor", True):
+        spawn(f, name, None, vol)
+
+
+def cmd_stop():
+    import os
+    import signal
+    for pid in players():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            (PLAYING / str(pid)).unlink()
+        except OSError:
+            pass
+
+
+def tone(path, freq, secs=2.0):
+    r = 48000
+    n = int(r * secs)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(r)
+        frames = bytearray()
+        for i in range(n):
+            fade = min(1.0, i / 2400, (n - i) / 2400)
+            v = int(32767 * 0.3 * fade * math.sin(2 * math.pi * freq * i / r))
+            frames += struct.pack("<hh", v, v)
+        w.writeframes(bytes(frames))
+
+
+def cmd_test():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    a, b = CACHE / "test-a.wav", CACHE / "test-b.wav"
+    tone(a, 440)
+    tone(b, 660)
+    vol = float(load_config().get("volume", 0.7))
+    print("playing a low tone, then a higher tone on top of it...")
+    spawn(a, "test tone A", SINK, vol)
+    time.sleep(0.6)
+    spawn(b, "test tone B", SINK, vol)
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = argv[1]
+    if cmd == "play" and len(argv) >= 3:
+        cmd_play(" ".join(argv[2:]))
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "list":
+        for s in load_library():
+            hk = load_config()["hotkeys"].get("sound:" + s["name"], "")
+            print(f"{s['name']:<24} {hk:<14} {s['path']}")
+    elif cmd == "add" and len(argv) >= 3:
+        lib = load_library()
+        name = argv[3] if len(argv) > 3 else Path(argv[2]).stem
+        lib.append({"name": name, "path": str(Path(argv[2]).expanduser().resolve())})
+        save_library(lib)
+        print("added", name)
+    elif cmd == "test":
+        cmd_test()
+    else:
+        print(__doc__)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,14 @@
+[Unit]
+Description=ToastFX Real-Time Voice Changer
+After=pipewire.service wireplumber.service toastfx-mic.service
+
+[Service]
+Type=simple
+Environment=TOASTFX_OUTPUT=toastfx_sink
+ExecStart=/usr/bin/toastfx
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

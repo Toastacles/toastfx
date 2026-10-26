@@ -1,0 +1,380 @@
+"""Window logic for toastfx-control: state, actions and background polling. No Tk, no Pillow."""
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from toastfx_common import *
+
+SERVICE = "toastfx"
+PER_PAGE = 8                 # slots per page; the "Add sound" tile takes one
+SOUND_ICONS = ["burst", "note", "chick", "flame", "cat", "pizza", "beer"]
+NAME_TO_ID = {"Dry Mic": "dry", "Radio": "radio", "Helmet Comms": "helmet", "Robot": "robot"}
+DEVNULL = subprocess.DEVNULL
+
+
+def parse_mode(journal_text):
+    """Last mode ToastFX reported, from its journal lines ('ToastFX running (mode: X)' / 'Mode: X')."""
+    mode = None
+    for line in journal_text.splitlines():
+        m = re.search(r"ToastFX running \(mode: ([^)]+)\)", line) or re.search(r"\bMode: (.+?)\s*$", line)
+        if m and m.group(1).strip() in NAME_TO_ID:
+            mode = NAME_TO_ID[m.group(1).strip()]
+    return mode
+
+
+def keysym_to_combo(keysym, state, ctrl_mask=0x4, alt_mask=0x8, shift_mask=0x1, super_mask=0x40):
+    """Tk key event (keysym name + state bits) -> 'Ctrl+Alt+1' or None for a bare modifier press."""
+    if keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
+                  "Meta_L", "Meta_R", "Caps_Lock", "Num_Lock", "ISO_Level3_Shift", "Mode_switch"):
+        return None
+    mods = []
+    if state & ctrl_mask:
+        mods.append("Ctrl")
+    if state & alt_mask:
+        mods.append("Alt")
+    if state & shift_mask:
+        mods.append("Shift")
+    if state & super_mask:
+        mods.append("Super")
+    key = keysym
+    if len(key) == 1:
+        key = key.lower()
+    if key == "ISO_Left_Tab":
+        key = "Tab"
+    return make_combo(mods, key)
+
+
+class Core:
+    def __init__(self):
+        self.cfg = load_config()
+        self.lib = load_library()
+        self.page = 0
+        self.mode = "dry"                 # the engine always starts in Dry Mic
+        self.engine = False
+        self.playing = set()              # names of sounds playing right now
+        self.level = 0.0
+        self.listening = None             # target being assigned, e.g. "voice:radio" / "sound:Airhorn"
+        self.flash = None                 # (lines, until) short-lived message for the hint box
+        self.hk_failed = []
+        self.hk_on = False
+        self.pw_detail = "PipeWire"
+        self.lock = threading.Lock()
+        self._ensure_icons()
+
+    # ---- library / pages ------------------------------------------------------------
+    def _ensure_icons(self):
+        changed = False
+        for s in self.lib:
+            if s["name"] not in self.cfg["icons"]:
+                self.cfg["icons"][s["name"]] = SOUND_ICONS[len(self.cfg["icons"]) % len(SOUND_ICONS)]
+                changed = True
+        if changed:
+            save_config(self.cfg)
+
+    def items(self):
+        return self.lib + [None]          # None = the "Add sound" tile
+
+    def pages(self):
+        return max(1, -(-len(self.items()) // PER_PAGE))
+
+    def page_items(self):
+        self.page = max(0, min(self.page, self.pages() - 1))
+        chunk = self.items()[self.page * PER_PAGE:(self.page + 1) * PER_PAGE]
+        return list(enumerate(chunk))     # [(slot, sound dict | None)]
+
+    def icon_for(self, name):
+        return self.cfg["icons"].get(name, SOUND_ICONS[0])
+
+    def turn_page(self, step):
+        self.page = max(0, min(self.pages() - 1, self.page + step))
+
+    def add_sounds(self, paths):
+        added = 0
+        have = {s["name"].lower() for s in self.lib}
+        for p in paths:
+            p = str(Path(p).expanduser().resolve())
+            base = Path(p).stem[:40] or "Sound"
+            name, n = base, 2
+            while name.lower() in have:
+                name, n = f"{base} {n}", n + 1
+            have.add(name.lower())
+            self.lib.append({"name": name, "path": p})
+            added += 1
+        if added:
+            save_library(self.lib)
+            self._ensure_icons()
+            self.page = self.pages() - 1
+            self.say([f"Added {added} sound" + ("s" if added > 1 else ""), ""])
+        return added
+
+    def remove_sound(self, name):
+        self.lib = [s for s in self.lib if s["name"] != name]
+        save_library(self.lib)
+        self.cfg["hotkeys"].pop("sound:" + name, None)
+        self.cfg["icons"].pop(name, None)
+        save_config(self.cfg)
+        self.reload_listener()
+        self.page = max(0, min(self.page, self.pages() - 1))
+
+    # ---- actions --------------------------------------------------------------------
+    def bg(self, argv, timeout=8, done=None):
+        def work():
+            try:
+                r = subprocess.run(argv, stdin=DEVNULL, capture_output=True, text=True, timeout=timeout)
+            except Exception as exc:
+                r = None
+                self.say(["Command failed", str(exc)[:18]], warn=True)
+            if done:
+                done(r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_voice(self, vid):
+        ctl = find_ctl()
+        if not ctl:
+            self.say(["toastfx-ctl", "not found"], warn=True)
+            return
+
+        def done(r):
+            if r is not None and r.returncode == 0:
+                self.mode = vid
+            elif r is not None:
+                self.say(["Engine not", "running?"], warn=True)
+        self.bg([ctl, vid], timeout=4, done=done)
+
+    def toggle_engine(self):
+        act = "stop" if self.engine else "start"
+        self.engine = not self.engine
+
+        def done(r):
+            if r is not None and r.returncode != 0:
+                self.say(["Engine command", "failed"], warn=True)
+        self.bg(["systemctl", "--user", act, SERVICE], timeout=15, done=done)
+
+    def play(self, name):
+        self.bg([sys.executable, str(BASE / "toastfx-sfx"), "play", name], timeout=15, done=self._sfx_done)
+
+    def stop_all(self):
+        self.bg([sys.executable, str(BASE / "toastfx-sfx"), "stop"], timeout=5)
+        self.playing = set()
+
+    def _sfx_done(self, r):
+        if r is not None and r.returncode != 0:
+            msg = (r.stderr or "").strip().splitlines()[-1:] or ["play failed"]
+            self.say(["Can't play:", msg[0].replace("toastfx-sfx: ", "")[:20]], warn=True)
+
+    def set_volume(self, v, save=False):
+        self.cfg["volume"] = max(0.0, min(1.0, float(v)))
+        if save:
+            save_config(self.cfg)
+
+    # ---- live tweaks (sent to the engine through its command pipe) ----------------------
+    TWEAKS = ("radio", "helmet", "mix")
+
+    def tweak(self, name):
+        return int(self.cfg.get("tweaks", {}).get(name, 100))
+
+    def set_tweak(self, name, value, save=False):
+        pct = int(round(max(0.0, min(1.0, float(value))) * 100))
+        tw = self.cfg.setdefault("tweaks", {})
+        changed = tw.get(name) != pct
+        tw[name] = pct
+        if changed and self.engine:
+            self.send_cmd(f"tweak {name} {pct}")
+        if save:
+            save_config(self.cfg)
+
+    def send_tweaks(self):
+        for name in self.TWEAKS:
+            self.send_cmd(f"tweak {name} {self.tweak(name)}")
+
+    def send_cmd(self, text):
+        d = os.environ.get("XDG_RUNTIME_DIR")
+        path = f"{d}/toastfx.cmd" if d else f"/tmp/toastfx-{os.getuid()}.cmd"
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return False
+        try:
+            os.write(fd, (text + "\n").encode())
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def toggle_monitor(self):
+        self.cfg["monitor"] = not self.cfg.get("monitor", True)
+        save_config(self.cfg)
+
+    # ---- hotkeys --------------------------------------------------------------------
+    def key_of(self, target):
+        return self.cfg["hotkeys"].get(target, "")
+
+    def key_text(self, target):
+        if self.listening == target:
+            return "PRESS A KEY", "listen"
+        k = self.key_of(target)
+        return (pretty(k), "set") if k else ("+ KEY", "empty")
+
+    def label_of(self, target):
+        kind, _, arg = target.partition(":")
+        return VOICE_LABELS.get(arg, arg) if kind == "voice" else arg
+
+    def begin_listen(self, target):
+        self.listening = target
+        signal_listener(signal.SIGUSR1)        # release the grabs so the window can see the key
+
+    def end_listen(self):
+        self.listening = None
+        self.reload_listener()
+
+    def reload_listener(self):
+        if not signal_listener(signal.SIGHUP):
+            self.start_listener()
+
+    def start_listener(self):
+        exe = BASE / "toastfx-hotkeys"
+        if not exe.exists() or listener_pid():
+            return
+        try:
+            subprocess.Popen([sys.executable, str(exe)], stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass
+
+    def assign(self, target, combo):
+        """Returns True when the combo was stored."""
+        parsed = parse_combo(combo)
+        if not parsed or not combo_ok(*parsed):
+            self.say(["Add Ctrl, Alt", "or Shift"], warn=True)
+            return False
+        stolen = [t for t, c in self.cfg["hotkeys"].items() if c == combo and t != target]
+        for t in stolen:
+            del self.cfg["hotkeys"][t]
+        self.cfg["hotkeys"][target] = combo
+        save_config(self.cfg)
+        if stolen:
+            self.say(["Moved from", self.label_of(stolen[0])[:14]])
+        self.end_listen()
+        return True
+
+    def clear(self, target):
+        self.cfg["hotkeys"].pop(target, None)
+        save_config(self.cfg)
+        self.end_listen()
+
+    # ---- hint box -------------------------------------------------------------------
+    def say(self, lines, warn=False, secs=3.0):
+        self.flash = (lines, warn, time.time() + secs)
+
+    def hint(self):
+        """(lines, warn) for the dashed box at the bottom right."""
+        if self.listening:
+            return ["Press a combo", "Esc cancels"], False
+        if self.flash and self.flash[2] > time.time():
+            return self.flash[0], self.flash[1]
+        if not self.hk_on:
+            return ["Hotkeys off", "click to start"], True
+        if self.hk_failed:
+            return ["Key in use:", pretty(self.hk_failed[0])], True
+        return ["Click a badge", "to set a key"], False
+
+    def hotkey_rows(self):
+        rows = []
+        for vid in VOICE_IDS:
+            rows.append((pretty(self.key_of("voice:" + vid)) or "—", VOICE_LABELS[vid]))
+        rows.append((pretty(self.key_of("stop:all")) or "—", "Stop all sounds"))
+        rows.append(("Bksp", "Clear a key"))
+        return rows
+
+    # ---- polling (runs in a thread) -------------------------------------------------
+    def poll_once(self):
+        out = {}
+        try:
+            r = subprocess.run(["systemctl", "--user", "is-active", SERVICE], capture_output=True, text=True, timeout=3)
+            out["engine"] = r.stdout.strip() == "active"
+        except Exception:
+            out["engine"] = None
+        if out["engine"]:
+            try:
+                r = subprocess.run(["journalctl", "--user", "-u", SERVICE, "-n", "60", "--no-pager", "-o", "cat"],
+                                   capture_output=True, text=True, timeout=4)
+                out["mode"] = parse_mode(r.stdout)
+            except Exception:
+                out["mode"] = None
+        out["playing"] = set(players().values())
+        out["hk_on"] = listener_pid() is not None
+        out["hk_failed"] = (read_json(HK_STATUS, {}) or {}).get("failed", [])
+        return out
+
+    def apply_poll(self, d):
+        if d.get("engine") is not None:
+            was = self.engine
+            self.engine = d["engine"]
+            if self.engine and not was:          # engine just (re)started: it begins at 100%, so resend ours
+                self.send_tweaks()
+        if d.get("mode"):
+            self.mode = d["mode"]
+        self.playing = d.get("playing", set())
+        self.hk_on = d.get("hk_on", False)
+        self.hk_failed = d.get("hk_failed", [])
+
+    def load_versions(self):
+        try:
+            out = subprocess.run(["pipewire", "--version"], capture_output=True, text=True, timeout=3).stdout
+            m = re.search(r"libpipewire\s+([\d.]+)", out)
+            if m:
+                self.pw_detail = f"PipeWire {m.group(1)}  •  48kHz  •  2ch"
+        except Exception:
+            pass
+
+
+class MeterReader(threading.Thread):
+    """Reads the processed mic (toastfx_mic) with parec and keeps a smoothed 0..1 level."""
+
+    def __init__(self, core):
+        super().__init__(daemon=True)
+        self.core, self.proc, self.stop_flag = core, None, False
+
+    def run(self):
+        import array
+        import math
+        if not shutil.which("parec"):
+            return
+        while not self.stop_flag:
+            try:
+                self.proc = subprocess.Popen(
+                    ["parec", f"--device={MIC_SOURCE}", "--raw", "--format=s16le", "--rate=24000", "--channels=1",
+                     "--latency-msec=40"], stdout=subprocess.PIPE, stderr=DEVNULL, bufsize=0)
+                while not self.stop_flag:
+                    raw = self.proc.stdout.read(2048)
+                    if not raw:
+                        break
+                    s = array.array("h")
+                    s.frombytes(raw[:len(raw) // 2 * 2])
+                    if s:
+                        rms = math.sqrt(sum(v * v for v in s) / len(s))
+                        lvl = min(1.0, math.sqrt(rms / 9000.0))
+                        old = self.core.level
+                        self.core.level = lvl if lvl > old else old * 0.82 + lvl * 0.18
+            except Exception:
+                pass
+            self.core.level = 0.0
+            for _ in range(20):
+                if self.stop_flag:
+                    return
+                time.sleep(0.1)
+
+    def stop(self):
+        self.stop_flag = True
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass

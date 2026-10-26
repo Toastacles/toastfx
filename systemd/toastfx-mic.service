@@ -1,0 +1,11 @@
+[Unit]
+Description=ToastFX virtual microphone (toastfx_sink -> toastfx_mic)
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pw-loopback -m "[ FL FR ]" --capture-props="media.class=Audio/Sink node.name=toastfx_sink node.description=ToastFX-Output" --playback-props="media.class=Audio/Source node.name=toastfx_mic node.description=ToastFX-Mic"
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,42 @@
+#!/bin/sh
+# toastfx-ctl - tell a running ToastFX to change voice.
+#   toastfx-ctl radio | helmet | robot | dry | quit
+
+case "$1" in
+    dry|radio|helmet|robot|quit) ;;
+    *)
+        echo "usage: toastfx-ctl dry|radio|helmet|robot|quit" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$XDG_RUNTIME_DIR" ]; then
+    fifo="$XDG_RUNTIME_DIR/toastfx.cmd"
+else
+    fifo="/tmp/toastfx-$(id -u).cmd"
+fi
+
+if [ ! -p "$fifo" ]; then
+    echo "ToastFX is not running. Start it with: systemctl --user start toastfx" >&2
+    exit 1
+fi
+
+# The timeout stops this hanging if ToastFX died and left the pipe behind.
+if ! timeout 1 sh -c 'printf "%s\n" "$1" > "$2"' sh "$1" "$fifo"; then
+    echo "Could not reach ToastFX." >&2
+    exit 1
+fi
+
+# Pop-up so you can see the change while in a game (skipped if unavailable).
+case "$1" in
+    dry)    label="Voice off (normal mic)" ;;
+    radio)  label="Radio" ;;
+    helmet) label="Helmet comms" ;;
+    robot)  label="Robot" ;;
+    quit)   label="ToastFX stopped" ;;
+esac
+if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a ToastFX -t 1500 -h string:x-canonical-private-synchronous:toastfx \
+        "ToastFX" "$label" >/dev/null 2>&1
+fi
+exit 0

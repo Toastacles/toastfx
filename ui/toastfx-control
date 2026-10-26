@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""toastfx-control: the ToastFX window. Voice effects, soundboard, hotkey badges, engine start/stop.
+
+The picture is drawn with Pillow (toastfx_ui.py) on top of the artwork in assets/skin.png; this file only
+shows it, forwards clicks and keys to toastfx_core.Core, and refreshes what changed.
+
+Environment:
+  TOASTFX_SCALE=0.8   force a window scale (default: fit the screen, at most 1.0 = 1536x1024)
+  TOASTFX_FLAT=1      draw the whole window as one opaque picture instead of layered pictures
+                      (use it if the glows look wrong on your Tk build)
+"""
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import toastfx_ui as U
+from toastfx_core import *
+
+DESIGN_W, DESIGN_H = 1536, 1024
+TILE_NAMES = [f"tile{i}" for i in range(PER_PAGE)]
+Z_ORDER = ["pill", "ebtn", "card0", "card1", "card2", "card3", "meter"] + TILE_NAMES + \
+          ["pager", "hotkeys", "tw0", "tw1", "tw2", "volume", "percent", "toggle", "hint"]
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.core = Core()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        sc = float(os.environ.get("TOASTFX_SCALE") or min(1.0, (sw - 60) / DESIGN_W, (sh - 110) / DESIGN_H))
+        self.sc = max(0.45, min(1.0, round(sc, 2)))
+        U.set_scale(self.sc)
+        self.flat = bool(os.environ.get("TOASTFX_FLAT"))
+        self.W, self.H = round(DESIGN_W * self.sc), round(DESIGN_H * self.sc)
+        root.title("ToastFX")
+        root.resizable(False, False)
+        self.canvas = tk.Canvas(root, width=self.W, height=self.H, highlightthickness=0, bd=0, bg="#141012")
+        self.canvas.pack()
+        self.skin = U.load_skin()
+        self.comp = {}            # name -> (PIL image, (x, y) in screen px)
+        self.keys = {}            # name -> last drawn state key
+        self.keep = {}            # name -> PhotoImage currently shown (Tk drops unreferenced images)
+        self.cache = {}           # (name, key) -> PhotoImage (layered mode)
+        self.ids = {}
+        self.hits = []            # (design rect, kind, payload), topmost first
+        self.brects = {}          # component -> badge rect (design px)
+        self.hover = None
+        self.drag = False
+        self.queue = queue.Queue()
+        self.dirty = True
+        self.last_flat = 0.0
+
+        if self.flat:
+            self.flat_photo = tk.PhotoImage(width=self.W, height=self.H)
+            self.flat_id = self.canvas.create_image(0, 0, image=self.flat_photo, anchor="nw")
+        else:
+            self.skin_photo = tk.PhotoImage(data=U.png_b64(self.skin))
+            self.canvas.create_image(0, 0, image=self.skin_photo, anchor="nw")
+            blank = tk.PhotoImage(width=1, height=1)
+            self.blank = blank
+            for name in Z_ORDER:
+                self.ids[name] = self.canvas.create_image(0, 0, image=blank, anchor="nw", state="hidden")
+
+        c = self.canvas
+        c.bind("<Motion>", self.on_motion)
+        c.bind("<Leave>", lambda e: self.set_hover(None))
+        c.bind("<Button-1>", self.on_click)
+        c.bind("<B1-Motion>", self.on_drag)
+        c.bind("<ButtonRelease-1>", self.on_release)
+        c.bind("<Button-3>", self.on_right_click)
+        root.bind("<KeyPress>", self.on_key)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        c.focus_set()
+
+        self.menu = tk.Menu(root, tearoff=0)
+        self.meter = MeterReader(self.core)
+        self.meter.start()
+        threading.Thread(target=self.core.load_versions, daemon=True).start()
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+        self.core.start_listener()
+        self.refresh()
+        root.after(120, self.tick)
+
+    # ---- drawing -----------------------------------------------------------------------
+    def place(self, name, key, render):
+        """Draw component `name` when its state key changed. render() -> (image, (x, y)[, badge rect])."""
+        if self.keys.get(name) == key:
+            return
+        self.keys[name] = key
+        res = render()
+        img, pos = res[0], res[1]
+        if len(res) > 2:
+            self.brects[name] = res[2]
+        px, py = round(pos[0] * self.sc), round(pos[1] * self.sc)
+        self.comp[name] = (img, (px, py))
+        self.dirty = True
+        if self.flat:
+            return
+        photo = self.cache.get((name, key))
+        if photo is None:
+            if len(self.cache) > 600:
+                self.cache.clear()
+            photo = tk.PhotoImage(data=U.png_b64(img))
+            self.cache[(name, key)] = photo
+        self.canvas.itemconfigure(self.ids[name], image=photo, state="normal")
+        self.canvas.coords(self.ids[name], px, py)
+        self.keep[name] = photo
+
+    def hide(self, name):
+        if self.keys.get(name) is None and name not in self.comp:
+            return
+        self.keys[name] = None
+        self.comp.pop(name, None)
+        self.dirty = True
+        if not self.flat:
+            self.canvas.itemconfigure(self.ids[name], state="hidden")
+
+    def flush_flat(self):
+        if not self.flat or not self.dirty:
+            return
+        now = time.time()
+        if now - self.last_flat < 0.12:
+            return
+        self.last_flat = now
+        frame = self.skin.copy()
+        for name in Z_ORDER:
+            if name in self.comp:
+                img, pos = self.comp[name]
+                frame.alpha_composite(img, dest=pos)
+        self.flat_photo = tk.PhotoImage(data=U.png_b64(frame.convert("RGB")))
+        self.canvas.itemconfigure(self.flat_id, image=self.flat_photo)
+        self.dirty = False
+
+    def refresh(self):
+        core = self.core
+        self.hits = []
+        hov = self.hover
+        running = core.engine
+
+        # header
+        self.place("pill", ("pill", running, core.pw_detail), lambda: U.engine_pill(running, core.pw_detail))
+        hov_e = hov == ("engine", None)
+        self.place("ebtn", ("ebtn", running, hov_e), lambda: U.engine_button(running, hov_e))
+        self.hits.append((U.STOPBTN, "engine", None))
+
+        # voices
+        for i, vid in enumerate(VOICE_IDS):
+            target = "voice:" + vid
+            kt, kk = core.key_text(target)
+            active = running and core.mode == vid
+            hv = hov == ("voice", vid)
+            self.place(f"card{i}", ("card", active, hv, kt, kk),
+                       lambda i=i, active=active, hv=hv, kt=kt, kk=kk:
+                       U.voice_card(i, active=active, hover=hv, key_text=kt, key_kind=kk))
+            self.hits.append((self.brects.get(f"card{i}", (0, 0, 0, 0)), "badge", target))
+            x, y = U.card_pos(i)
+            self.hits.append(((x, y, x + U.CARD_W, y + U.CARD_H), "voice", vid))
+
+        # meter
+        self.place("meter", ("meter", int(core.level * 40)), lambda: U.meter(core.level))
+
+        # soundboard
+        shown = core.page_items()
+        used = set()
+        for slot, snd in shown:
+            name = TILE_NAMES[slot]
+            used.add(name)
+            x, y = U.tile_pos(slot)
+            rect = (x, y, x + U.TILE_W, y + U.TILE_H)
+            if snd is None:
+                hv = hov == ("add", None)
+                self.place(name, ("add", hv), lambda slot=slot, hv=hv: U.add_tile(slot, hv))
+                self.hits.append((rect, "add", None))
+            else:
+                target = "sound:" + snd["name"]
+                kt, kk = core.key_text(target)
+                playing = snd["name"] in core.playing
+                hv = hov == ("sound", snd["name"])
+                icon_name = core.icon_for(snd["name"])
+                self.place(name, ("tile", snd["name"], icon_name, playing, hv, kt, kk),
+                           lambda slot=slot, snd=snd, icon_name=icon_name, kt=kt, kk=kk, playing=playing, hv=hv:
+                           U.sound_tile(slot, snd["name"], icon_name, kt, kk, playing=playing, hover=hv))
+                self.hits.append((self.brects.get(name, (0, 0, 0, 0)), "badge", target))
+                self.hits.append((rect, "sound", snd["name"]))
+        for name in TILE_NAMES:
+            if name not in used:
+                self.hide(name)
+
+        # pager
+        pages = core.pages()
+        if pages > 1:
+            hp = hov[1] if hov and hov[0] == "pager" else None
+            self.place("pager", ("pager", core.page, pages, hp), lambda: U.pager(core.page, pages, hp))
+            x0, y0, x1, y1 = U.PAGER
+            self.hits.append(((x0, y0, x0 + 36, y1), "pager", "prev"))
+            self.hits.append(((x1 - 36, y0, x1, y1), "pager", "next"))
+        else:
+            self.hide("pager")
+
+        # right column
+        rows = core.hotkey_rows()
+        self.place("hotkeys", ("hotkeys", tuple(rows)), lambda: U.hotkey_list(rows))
+        for i, tname in enumerate(core.TWEAKS):
+            v = core.tweak(tname) / 100.0
+            act = self.drag == ("tweak", i)
+            self.place(f"tw{i}", ("tw", v, act), lambda i=i, v=v, act=act: U.tweak_row(i, v, act))
+            self.hits.append(((U.TW_X0 - 18, U.TW_Y[i] - 22, U.TW_X1 + 18, U.TW_Y[i] + 22), "tweak", i))
+
+        # footer
+        vol = round(core.cfg["volume"], 2)
+        self.place("volume", ("volume", vol), lambda: U.volume(vol))
+        self.place("percent", ("percent", vol), lambda: U.percent(vol))
+        mon = bool(core.cfg.get("monitor", True))
+        self.place("toggle", ("toggle", mon), lambda: U.toggle(mon))
+        lines, warn = core.hint()
+        self.place("hint", ("hint", tuple(lines), warn), lambda: U.hint(lines, U.WARN if warn else U.DIM))
+        self.hits.append((U.STOPALL, "stopall", None))
+        self.hits.append(((U.TOGGLE[0] - 120, U.TOGGLE[1] - 14, U.TOGGLE[2] + 10, U.TOGGLE[3] + 14), "toggle", None))
+        self.hits.append(((U.VOL_X0 - 18, U.VOL_Y - 24, U.VOL_X1 + 18, U.VOL_Y + 24), "volume", None))
+        self.hits.append((U.HINT, "hint", None))
+        self.flush_flat()
+
+    # ---- events ------------------------------------------------------------------------
+    def design_xy(self, e):
+        return e.x / self.sc, e.y / self.sc
+
+    def hit(self, x, y):
+        for (x0, y0, x1, y1), kind, payload in self.hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return kind, payload
+        return None
+
+    def set_hover(self, h):
+        if h != self.hover:
+            self.hover = h
+            self.canvas.configure(cursor="hand2" if h else "")
+            self.refresh()
+
+    def on_motion(self, e):
+        if self.drag:
+            return
+        h = self.hit(*self.design_xy(e))
+        if h and h[0] in ("voice", "sound", "add", "engine", "pager"):
+            self.set_hover(h)
+        else:
+            self.set_hover(None)
+            self.canvas.configure(cursor="hand2" if h else "")
+
+    def on_click(self, e):
+        self.canvas.focus_set()
+        h = self.hit(*self.design_xy(e))
+        core = self.core
+        if core.listening and not (h and h[0] == "badge"):
+            core.end_listen()
+        if not h:
+            return self.refresh()
+        kind, p = h
+        if kind == "voice":
+            core.set_voice(p)
+        elif kind == "sound":
+            core.play(p)
+        elif kind == "badge":
+            core.begin_listen(p) if core.listening != p else core.end_listen()
+        elif kind == "add":
+            self.add_sound()
+        elif kind == "pager":
+            core.turn_page(-1 if p == "prev" else 1)
+        elif kind == "stopall":
+            core.stop_all()
+        elif kind == "engine":
+            core.toggle_engine()
+        elif kind == "toggle":
+            core.toggle_monitor()
+        elif kind == "tweak":
+            self.drag = ("tweak", p)
+            self.set_tweak(p, self.design_xy(e)[0])
+        elif kind == "volume":
+            self.drag = True
+            self.set_volume(self.design_xy(e)[0])
+        elif kind == "hint" and not core.hk_on:
+            core.start_listener()
+            core.say(["Starting", "hotkeys..."])
+        self.refresh()
+
+    def set_volume(self, dx, save=False):
+        v = (dx - U.VOL_X0) / (U.VOL_X1 - U.VOL_X0)
+        self.core.set_volume(v, save=save)
+
+    def set_tweak(self, i, dx, save=False):
+        v = (dx - U.TW_X0) / (U.TW_X1 - U.TW_X0)
+        self.core.set_tweak(self.core.TWEAKS[i], v, save=save)
+
+    def on_drag(self, e):
+        if self.drag:
+            if isinstance(self.drag, tuple):
+                self.set_tweak(self.drag[1], self.design_xy(e)[0])
+            else:
+                self.set_volume(self.design_xy(e)[0])
+            self.refresh()
+
+    def on_release(self, e):
+        if self.drag:
+            kind, self.drag = self.drag, False
+            if isinstance(kind, tuple):
+                self.set_tweak(kind[1], self.design_xy(e)[0], save=True)
+            else:
+                self.set_volume(self.design_xy(e)[0], save=True)
+            self.refresh()
+
+    def on_right_click(self, e):
+        h = self.hit(*self.design_xy(e))
+        if not h or h[0] not in ("sound", "badge") or (h[0] == "badge" and not h[1].startswith("sound:")):
+            return
+        name = h[1] if h[0] == "sound" else h[1][len("sound:"):]
+        target = "sound:" + name
+        m = self.menu
+        m.delete(0, "end")
+        m.add_command(label=f"Play “{name}”", command=lambda: self.core.play(name))
+        m.add_command(label="Set hotkey…", command=lambda: (self.core.begin_listen(target), self.refresh()))
+        m.add_command(label="Clear hotkey", command=lambda: (self.core.clear(target), self.refresh()))
+        m.add_separator()
+        m.add_command(label="Remove from board", command=lambda: self.remove(name))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def remove(self, name):
+        if messagebox.askyesno("Remove sound", f"Remove “{name}” from the board?\n(The file itself is not deleted.)"):
+            self.core.remove_sound(name)
+            self.refresh()
+
+    def add_sound(self):
+        paths = filedialog.askopenfilenames(
+            title="Add sounds",
+            filetypes=[("Audio", "*.wav *.mp3 *.ogg *.flac *.m4a *.aac *.opus *.aiff *.wma"), ("All files", "*.*")])
+        if paths:
+            self.core.add_sounds(paths)
+
+    def on_key(self, e):
+        core = self.core
+        if not core.listening:
+            return
+        target = core.listening
+        if e.keysym == "Escape":
+            core.end_listen()
+        elif e.keysym in ("BackSpace", "Delete"):
+            core.clear(target)
+        else:
+            combo = keysym_to_combo(e.keysym, e.state)
+            if combo is None:
+                return
+            core.assign(target, combo)
+        self.refresh()
+        return "break"
+
+    # ---- background ----------------------------------------------------------------------
+    def poll_loop(self):
+        while True:
+            try:
+                self.queue.put(self.core.poll_once())
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def tick(self):
+        try:
+            while True:
+                self.core.apply_poll(self.queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.refresh()
+        self.root.after(120, self.tick)
+
+    def close(self):
+        self.meter.stop()
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
