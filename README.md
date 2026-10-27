@@ -10,15 +10,33 @@ Real-time voice changer and soundboard for Linux (PipeWire), built for games and
 
 > Status: works on Pop!_OS (X11, PipeWire 1.x, KDE/COSMIC). Other setups are untested.
 
+
 ## Install (Debian / Ubuntu / Pop!_OS)
+
+### Option 1: Install the prebuilt package (recommended)
+
+1. Download the latest `toastfx` `.deb` package from the [GitHub Releases page](https://github.com/Toastacles/toastfx/releases).
+2. Open a terminal in your Downloads folder and run:
+
+   ```bash
+   sudo apt install ./toastfx_1.0.0_*.deb
+   ```
+
+   If the downloaded filename differs, replace the wildcard pattern with the actual filename.
+
+### Option 2: Build from source
+
+Install the required build dependencies, clone the repository, and build the Debian package:
 
 ```bash
 sudo apt install build-essential pkg-config libpipewire-0.3-dev
-git clone https://github.com/Toastacles/toastfx.git && cd toastfx
+git clone https://github.com/Toastacles/toastfx.git
+cd toastfx
 ./packaging/build-deb.sh
-sudo apt install ./packaging/toastfx_1.0.0_*.deb      # (copy the .deb to /tmp first to avoid an apt sandbox note)
+sudo apt install ./packaging/toastfx_1.0.0_*.deb
 ```
 
+**Note:** If APT reports a sandbox warning when installing a locally built package, copy the `.deb` to a directory accessible to APT, such as `/tmp`, and install it from there.
 First run (as your normal user):
 
 ```bash
