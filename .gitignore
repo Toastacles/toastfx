@@ -6,3 +6,4 @@ __pycache__/
 *.f32
 .DS_Store
 tools/*_check.png
+!ui/assets/callouts/*.wav
