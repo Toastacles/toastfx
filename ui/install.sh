@@ -50,7 +50,7 @@ Type=Application
 Name=ToastFX
 Comment=Voice effects and soundboard
 Exec=$DEST/toastfx-control
-Icon=$DEST/assets/bread.png
+Icon=$DEST/assets/app_icon.png
 Categories=AudioVideo;Audio;
 Terminal=false
 D
