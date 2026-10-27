@@ -14,7 +14,7 @@ Real-time voice changer and soundboard for Linux (PipeWire), built for games and
 
 ```bash
 sudo apt install build-essential pkg-config libpipewire-0.3-dev
-git clone https://github.com/<you>/toastfx.git && cd toastfx
+git clone https://github.com/Toastacles/toastfx.git && cd toastfx
 ./packaging/build-deb.sh
 sudo apt install ./packaging/toastfx_1.0.0_*.deb      # (copy the .deb to /tmp first to avoid an apt sandbox note)
 ```
