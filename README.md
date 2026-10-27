@@ -3,11 +3,17 @@
 Real-time voice changer and soundboard for Linux (PipeWire), built for games and Discord.
 
 - Voice effects: **Dry Mic**, **Radio** (wartime tinny), **Helmet Comms** (squad comms), **Robot**
-- Live **Quick Tweaks** sliders: Radio Filter, Helmet Filter, Dry/Wet Mix
+- Live **Quick Tweaks** sliders: Radio Strength, Helmet Strength, Dry/Wet Mix
 - **Soundboard** that mixes into your mic through PipeWire (mp3, wav, ogg, flac, m4a ...)
-- **Squad callouts**: four radio cues (Comms Check, Acknowledge, Incoming, Disconnect) with their own keys, volumes and on/off, replaceable with your own WAV. See `docs/CALLOUTS.md`
+- **Squad callouts**: four radio cues (Comms Check, Acknowledge, Incoming, Disconnect) with their own keys, volumes and on/off, replaceable with your own WAV, plus an optional **Auto beep** after you stop talking (Helmet mode). See `docs/CALLOUTS.md`
 - **Global hotkeys** for every voice and sound (X11), with key badges on each button
 - One window, one `.deb`
+
+![ToastFX: voices, quick tweaks and the soundboard](docs/screenshots/window-voices-soundboard.png)
+
+![ToastFX: squad callouts and the auto beep](docs/screenshots/window-callouts.png)
+
+*The pictures are rendered from the window's own drawing code with example sounds and keys; regenerate them with `python3 tools/render_screenshots.py`.*
 
 > Status: works on Pop!_OS (X11, PipeWire 1.x, KDE/COSMIC). Other setups are untested.
 
@@ -74,7 +80,7 @@ Open the **Callouts** tab. Nothing is bound until you set a key. Full details, W
 | `packaging/` | `.deb` builder |
 | `systemd/` | user service examples |
 | `windows/` | Windows proof of concept |
-| `tools/` | scripts used to cut the artwork into `ui/assets` |
+| `tools/` | artwork and sound generators, screenshot renderer |
 | `docs/` | how it fits together, callouts |
 | `tests/` | automated tests |
 

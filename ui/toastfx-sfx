@@ -8,7 +8,7 @@
   toastfx-sfx test              play two test tones, one after the other overlapping
 
 Squad callouts (four cues; each has its own on/off, volume and optional key; see docs/CALLOUTS.md):
-  toastfx-sfx callout SLOT      play one: comms_check | ack | incoming | disconnect
+  toastfx-sfx callout SLOT [--quiet]   play one: comms_check | ack | incoming | disconnect (--quiet: no desktop note)
   toastfx-sfx callouts          show status of the master switch and the four slots
   toastfx-sfx callout-replace SLOT FILE.wav   use your own WAV for a slot (converted to 48 kHz stereo)
   toastfx-sfx callout-reset SLOT              go back to the shipped sound
@@ -140,33 +140,37 @@ def valid_wav(path):
         return False
 
 
-def cmd_callout(slot):
+def cmd_callout(slot, quiet=False):
     if slot not in CALLOUT_IDS:
         die(f"unknown callout '{slot}' (use: {', '.join(CALLOUT_IDS)})")
     label = CALLOUT_LABELS[slot]
     cfg = load_config()
     co = callouts_cfg(cfg)
     if not co["enabled"]:
-        notify("Callout soundboard is off")
+        if not quiet:
+            notify("Callout soundboard is off")
         print("toastfx-sfx: callout soundboard is off", file=sys.stderr)
         return EXIT_OFF
     sl = co["slots"][slot]
     if not sl["enabled"]:
-        notify(f"{label} is off")
+        if not quiet:
+            notify(f"{label} is off")
         print(f"toastfx-sfx: {label} is off", file=sys.stderr)
         return EXIT_OFF
     if debounced(slot):
         return 0
     f = callout_file(slot)
     if f is None or not valid_wav(f):
-        notify(f"{label}: sound unavailable")
+        if not quiet:
+            notify(f"{label}: sound unavailable")
         print(f"toastfx-sfx: {label}: sound file missing or unreadable", file=sys.stderr)
         return EXIT_MISSING
     vol = max(0.0, min(1.0, co["volume"] * sl["volume"]))
     spawn(f, f"callout:{slot}", SINK, vol)              # PipeWire mixes it into the virtual mic with your voice
     if cfg.get("monitor", False):                        # only to your headphones if you chose "hear it myself"
         spawn(f, f"callout:{slot}", None, vol)
-    notify(label)
+    if not quiet:
+        notify(label)
     return 0
 
 
@@ -247,7 +251,7 @@ def main(argv):
     elif cmd == "test":
         cmd_test()
     elif cmd == "callout" and len(argv) >= 3:
-        return cmd_callout(argv[2])
+        return cmd_callout(argv[2], quiet="--quiet" in argv[3:])
     elif cmd == "callouts":
         cmd_callouts_status()
     elif cmd in ("callouts-on", "callouts-off"):

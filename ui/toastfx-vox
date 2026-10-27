@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""toastfx-vox: plays a short callout (a "roger beep") after you stop talking, only while Helmet Comms is active.
+
+Started and stopped by toastfx-hotkeys when "Auto beep" is switched on in the Callouts tab. You don't run it by hand.
+
+How it works: it reads the *level* of the processed mic (toastfx_mic) with parec, 50 times a second, and runs it
+through toastfx_common.SpeechGate. Nothing is recorded, saved or sent anywhere; each 20 ms block is reduced to one
+number and dropped. When you finish talking it runs `toastfx-sfx callout <cue> --quiet`, so every normal callout rule
+(master switch, per-cue switch, volume, key-repeat guard, monitor off by default) applies.
+
+It listens only while all of these are true: Auto beep is on, the callout soundboard is on, Helmet Comms is the
+active voice. Otherwise parec is not even running. It never reacts to its own cue or to soundboard clips.
+"""
+import array
+import math
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from toastfx_common import *
+from toastfx_core import parse_mode
+
+RATE, FRAME_BYTES = 16000, 640                    # 20 ms of mono s16le
+DEVNULL = subprocess.DEVNULL
+POLL = 2.0                                        # seconds between config / voice-mode checks
+state = {"quit": False, "want": False, "sens": 0.5, "slot": "ack"}
+
+
+def on_signal(_sig, _frame):
+    state["quit"] = True
+
+
+def current_mode():
+    try:
+        r = subprocess.run(["journalctl", "--user", "-u", "toastfx", "-n", "60", "--no-pager", "-o", "cat"],
+                           stdin=DEVNULL, capture_output=True, text=True, timeout=4)
+        return parse_mode(r.stdout)
+    except Exception:
+        return None
+
+
+def poller():
+    """Keeps state['want'] / sensitivity / cue up to date from the config and the journal."""
+    while not state["quit"]:
+        try:
+            co = callouts_cfg(load_config())
+            au = co["auto"]
+            state["sens"], state["slot"] = au["sensitivity"], au["slot"]
+            on = au["enabled"] and co["enabled"] and co["slots"][au["slot"]]["enabled"]
+            state["want"] = bool(on and current_mode() == "helmet")
+        except Exception:
+            state["want"] = False
+        for _ in range(int(POLL / 0.1)):
+            if state["quit"]:
+                return
+            time.sleep(0.1)
+
+
+def busy():
+    """True while any soundboard clip or callout is playing (they pass through the mic and must not count as talking)."""
+    try:
+        return bool(players())
+    except Exception:
+        return False
+
+
+def fire(slot):
+    try:
+        subprocess.Popen([sys.executable, str(BASE / "toastfx-sfx"), "callout", slot, "--quiet"],
+                         stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def start_parec():
+    return subprocess.Popen(["parec", f"--device={MIC_SOURCE}", "--raw", "--format=s16le", f"--rate={RATE}",
+                             "--channels=1", "--latency-msec=20"], stdin=DEVNULL, stdout=subprocess.PIPE,
+                            stderr=DEVNULL, bufsize=0)
+
+
+def stop_parec(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def main():
+    if not shutil.which("parec"):
+        print("toastfx-vox: parec not found (sudo apt install pulseaudio-utils)", file=sys.stderr)
+        return 1
+    old = VOX_PID.read_text().strip() if VOX_PID.exists() else ""
+    if old.isdigit() and int(old) != os.getpid() and pid_alive(int(old), "toastfx-vox"):
+        return 0                                   # already running
+    RUN.mkdir(parents=True, exist_ok=True)
+    VOX_PID.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    try:
+        co = callouts_cfg(load_config())["auto"]
+        state["sens"], state["slot"] = co["sensitivity"], co["slot"]
+    except Exception:
+        pass
+    threading.Thread(target=poller, daemon=True).start()
+    gate, proc, buf, last_busy, check = SpeechGate(state["sens"]), None, b"", 0.0, 0.0
+    print("toastfx-vox running", flush=True)
+    try:
+        while not state["quit"]:
+            if state["want"] and proc is None:
+                try:
+                    proc, buf = start_parec(), b""
+                    gate = SpeechGate(state["sens"])
+                except OSError:
+                    proc = None
+                    time.sleep(1)
+            elif not state["want"] and proc is not None:
+                stop_parec(proc)
+                proc = None
+            if proc is None:
+                time.sleep(0.2)
+                continue
+            ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+            if not ready:
+                if proc.poll() is not None:
+                    proc = None
+                continue
+            chunk = proc.stdout.read(FRAME_BYTES * 4)
+            if not chunk:
+                proc = None
+                time.sleep(0.5)
+                continue
+            buf += chunk
+            gate.set_sensitivity(state["sens"])
+            while len(buf) >= FRAME_BYTES:
+                frame, buf = buf[:FRAME_BYTES], buf[FRAME_BYTES:]
+                s = array.array("h")
+                s.frombytes(frame)
+                rms = math.sqrt(sum(v * v for v in s) / len(s)) / 32768.0
+                db = 20 * math.log10(rms) if rms > 1e-6 else -120.0
+                now = time.monotonic()
+                if now - check > 0.1:
+                    check = now
+                    if busy():
+                        last_busy = now
+                muted = now - last_busy < 0.5       # a clip is playing or just ended
+                if gate.feed(db, muted):
+                    fire(state["slot"])
+    finally:
+        stop_parec(proc)
+        try:
+            if VOX_PID.read_text().strip() == str(os.getpid()):
+                VOX_PID.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

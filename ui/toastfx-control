@@ -22,7 +22,7 @@ from toastfx_core import *
 
 DESIGN_W, DESIGN_H = 1536, 1024
 TILE_NAMES = [f"tile{i}" for i in range(PER_PAGE)]
-CO_NAMES = [f"co{i}" for i in range(len(CALLOUT_IDS))] + ["comaster", "covol", "coinfo"]
+CO_NAMES = [f"co{i}" for i in range(len(CALLOUT_IDS))] + ["comaster", "covol", "coauto"]
 Z_ORDER = ["pill", "ebtn", "card0", "card1", "card2", "card3", "meter"] + TILE_NAMES + CO_NAMES + \
           ["tabs", "pager", "hotkeys", "tw0", "tw1", "tw2", "volume", "percent", "toggle", "hint"]
 
@@ -264,7 +264,16 @@ class App:
         self.hits.append((U.CO_MASTER, "co_master", None))
         self.place("covol", ("covol", vol, on), lambda: U.co_volume(vol, on))
         self.hits.append(((U.CO_VX0 - 16, U.CO_VY - 14, U.CO_VX1 + 16, U.CO_VY + 14), "co_vol", None))
-        self.place("coinfo", ("coinfo",), U.co_info)
+        au = core.auto()
+        st, kind = core.auto_status()
+        sens = round(au["sensitivity"], 2)
+        sname = CALLOUT_SHORT[au["slot"]]
+        self.place("coauto", ("coauto", au["enabled"], st, sens, au["slot"]),
+                   lambda: U.co_auto(au["enabled"], st, kind, sname, sens))
+        x0, y0, x1, y1 = U.AUTO_SW
+        self.hits.append(((x0 - 8, y0 - 8, x1 + 8, y1 + 8), "auto_switch", None))
+        self.hits.append(((U.AUTO_SL0 - 14, U.AUTO_SLY - 12, U.AUTO_SL1 + 14, U.AUTO_SLY + 12), "auto_sens", None))
+        self.hits.append((U.CO_AUTO, "auto_tile", None))
 
     # ---- events ------------------------------------------------------------------------
     def design_xy(self, e):
@@ -317,6 +326,11 @@ class App:
             core.toggle_slot(p)
         elif kind == "co_master":
             core.toggle_callouts()
+        elif kind in ("auto_switch", "auto_tile"):
+            core.toggle_auto()
+        elif kind == "auto_sens":
+            self.drag = ("auto", None)
+            self.set_auto_sens(self.design_xy(e)[0])
         elif kind == "co_slider":
             self.drag = ("slot", p)
             self.set_co_vol(p, self.design_xy(e)[0])
@@ -358,8 +372,13 @@ class App:
             v = (dx - (U.tile_pos(i)[0] + U.SL_X0)) / (U.SL_X1 - U.SL_X0)
         self.core.set_co_volume(v, sid, save=save)
 
+    def set_auto_sens(self, dx, save=False):
+        self.core.set_auto_sens((dx - U.AUTO_SL0) / (U.AUTO_SL1 - U.AUTO_SL0), save=save)
+
     def drag_to(self, kind, dx, save=False):
-        if kind[0] == "tweak":
+        if kind[0] == "auto":
+            self.set_auto_sens(dx, save)
+        elif kind[0] == "tweak":
             self.set_tweak(kind[1], dx, save)
         elif kind[0] == "slot":
             self.set_co_vol(kind[1], dx, save)
@@ -385,6 +404,8 @@ class App:
 
     def on_right_click(self, e):
         h = self.hit(*self.design_xy(e))
+        if h and h[0] in ("auto_tile", "auto_switch", "auto_sens"):
+            return self.auto_menu(e)
         if h and (h[0] in ("callout", "co_switch", "co_slider") or (h[0] == "badge" and h[1].startswith("callout:"))):
             sid = h[1][len("callout:"):] if h[0] == "badge" else h[1]
             return self.callout_menu(e, sid)
@@ -400,6 +421,25 @@ class App:
         m.add_command(label="Rename…", command=lambda: self.rename(name))
         m.add_separator()
         m.add_command(label="Remove from board", command=lambda: self.remove(name))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def auto_menu(self, e):
+        core = self.core
+        m = self.menu
+        m.delete(0, "end")
+        m.add_command(label="Turn off" if core.auto()["enabled"] else "Turn on",
+                      command=lambda: (core.toggle_auto(), self.refresh()))
+        m.add_separator()
+        m.add_command(label="Beep sound:", state="disabled")
+        for sid in CALLOUT_IDS:
+            mark = "\u25cf " if core.auto()["slot"] == sid else "    "
+            m.add_command(label=f"{mark}{CALLOUT_LABELS[sid]}",
+                          command=lambda sid=sid: (core.set_auto_slot(sid), self.refresh()))
+        m.add_separator()
+        m.add_command(label="Test the beep", command=lambda: core.play_callout(core.auto()["slot"]))
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:

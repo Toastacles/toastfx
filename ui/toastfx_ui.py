@@ -480,7 +480,9 @@ ROW2_Y = TILE_Y0 + TILE_SY
 CO_MASTER = (TILE_X0, ROW2_Y, TILE_X0 + TILE_W, ROW2_Y + TILE_H)
 CO_VOL = (TILE_X0 + TILE_SX, ROW2_Y, TILE_X0 + 2 * TILE_SX + TILE_W, ROW2_Y + TILE_H)
 CO_VX0, CO_VX1, CO_VY = CO_VOL[0] + 30, CO_VOL[2] - 110, ROW2_Y + 70
-CO_INFO = (TILE_X0 + 3 * TILE_SX, ROW2_Y, TILE_X0 + 3 * TILE_SX + TILE_W, ROW2_Y + TILE_H)
+CO_AUTO = (TILE_X0 + 3 * TILE_SX, ROW2_Y, TILE_X0 + 3 * TILE_SX + TILE_W, ROW2_Y + TILE_H)
+AUTO_SW = (CO_AUTO[2] - 12 - 48, ROW2_Y + 14, CO_AUTO[2] - 12, ROW2_Y + 14 + 24)
+AUTO_SL0, AUTO_SL1, AUTO_SLY = CO_AUTO[0] + 100, CO_AUTO[0] + 200, ROW2_Y + 92
 CO_SWITCH = (CO_MASTER[2] - 12 - 56, ROW2_Y + 62, CO_MASTER[2] - 12, ROW2_Y + 62 + 28)
 
 
@@ -625,12 +627,23 @@ def co_volume(value, on, active=False):
     return cv.done(), (CO_VOL[0] - pad, CO_VOL[1] - pad)
 
 
-def co_info():
-    w, h = CO_INFO[2] - CO_INFO[0], CO_INFO[3] - CO_INFO[1]
-    cv = Cv(w, h)
-    for i, ln in enumerate(("Click a cue to test it", "Right-click: your own WAV", "Stop sounds also stops cues")):
-        cv.text((6, 22 + i * 28), ln, 16, DIM, bold=False, anchor="lm", maxw=w - 8)
-    return cv.done(), (CO_INFO[0], CO_INFO[1])
+def co_auto(enabled, status, kind, slot_name, sens):
+    """The Auto beep tile: switch, what it plays, what it is doing right now, a sensitivity slider."""
+    pad = 20
+    w, h = CO_AUTO[2] - CO_AUTO[0], CO_AUTO[3] - CO_AUTO[1]
+    cv = Cv(w + 2 * pad, h + 2 * pad)
+    _panel(cv, (pad, pad, pad + w, pad + h))
+    cv.text((pad + 22, pad + 28), "Auto beep", 22, (233, 233, 242) if enabled else (150, 150, 162), anchor="lm")
+    _switch(cv, pad + w - 12 - 48, pad + 14, 48, 24, enabled)
+    cv.text((pad + 22, pad + 54), f"Helmet only \u00b7 plays {slot_name}", 15, DIM, bold=False, anchor="lm", maxw=w - 40)
+    col = {"off": (150, 150, 162), "wait": WARN, "armed": (205, 192, 172), "live": (126, 224, 82)}[kind]
+    cv.text((pad + 22, pad + 74), status, 14, col, anchor="lm", maxw=w - 40)
+    cv.text((pad + 22, pad + AUTO_SLY - CO_AUTO[1]), "Sensitivity", 13, DIM, bold=False, anchor="lm")
+    _mini_slider(cv, pad + AUTO_SL0 - CO_AUTO[0], pad + AUTO_SL1 - CO_AUTO[0], pad + AUTO_SLY - CO_AUTO[1], sens,
+                 on=enabled)
+    cv.text((pad + AUTO_SL1 - CO_AUTO[0] + 24, pad + AUTO_SLY - CO_AUTO[1]), f"{int(round(sens * 100))}%", 14, DIM,
+            bold=False, anchor="lm")
+    return cv.done(), (CO_AUTO[0] - pad, CO_AUTO[1] - pad)
 
 
 def load_skin():

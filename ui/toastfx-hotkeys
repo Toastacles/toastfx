@@ -110,6 +110,45 @@ def run(argv):
         print("toastfx-hotkeys: could not run", argv[0], exc, file=sys.stderr)
 
 
+class Vox:
+    """Owns the toastfx-vox child (the auto beep watcher): running exactly while Auto beep is on."""
+
+    def __init__(self):
+        self.proc, self.retry_at = None, 0.0
+
+    @staticmethod
+    def wanted():
+        co = callouts_cfg(load_config())
+        return bool(co["auto"]["enabled"] and co["enabled"])
+
+    def sync(self):
+        try:
+            want = self.wanted()
+        except Exception:
+            want = False
+        alive = self.proc is not None and self.proc.poll() is None
+        if want and not alive and time.monotonic() >= self.retry_at:
+            exe = BASE / "toastfx-vox"
+            if exe.exists():
+                try:
+                    self.proc = subprocess.Popen([sys.executable, str(exe)], stdin=DEVNULL, stdout=DEVNULL,
+                                                 stderr=DEVNULL, start_new_session=True)
+                except OSError:
+                    self.proc = None
+            self.retry_at = time.monotonic() + 10      # if it dies at once, don't respawn in a tight loop
+        elif not want and alive:
+            self.stop()
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+
 def keycode_for(dpy, key):
     name = key.lower() if len(key) == 1 else key
     sym = x11.XStringToKeysym(name.encode())
@@ -188,6 +227,9 @@ def main():
         write_status(ok, failed)
 
     print("toastfx-hotkeys running", flush=True)
+    vox = Vox()
+    vox.sync()
+    last_sync = time.monotonic()
     ev = XEvent()
     last_seen = {}        # callout action -> time of its latest key event (repeat guard)
     try:
@@ -195,6 +237,10 @@ def main():
             if state["reload"]:
                 state["reload"] = False
                 grab_all()
+                vox.sync()
+            if time.monotonic() - last_sync > 5:          # also picks the watcher back up if it ever dies
+                last_sync = time.monotonic()
+                vox.sync()
             select.select([fd], [], [], 0.5)
             while x11.XPending(dpy):
                 x11.XNextEvent(dpy, ctypes.byref(ev))
@@ -211,6 +257,7 @@ def main():
                         if argv:
                             run(argv)
     finally:
+        vox.stop()
         try:
             release()
             HK_PID.unlink()

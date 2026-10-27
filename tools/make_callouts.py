@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates the four shipped callout sounds from scratch (original, no samples, public domain / MIT with the project).
-Output: ui/assets/callouts/*.wav  (48 kHz, stereo, 16-bit, peak about -9 dBFS so mixing with a voice has headroom)
-Usage: python3 tools/make_callouts.py [output_dir]   |   --audition  plays the four Incoming options
+Output: ui/assets/callouts/*.wav  (48 kHz, stereo, 16-bit, peak about -12 dBFS (shipped set) so mixing with a voice has headroom)
+Usage: python3 tools/make_callouts.py [output_dir] [--style cam-soft|cam|muffled]   |   --audition  plays the four Incoming options
 """
 import sys
 import wave
@@ -185,6 +185,124 @@ DISC_VARIANTS = {"a": disc_a, "b": disc_b, "c": disc_c}
 disconnect = disc_c
 
 
+SOFT = {"hiss": 1.0, "tick": 1.0, "drive": 1.0, "cut": 1.0, "thump": 1.0, "attack": 0.0}   # "cam-soft" turns these down
+
+
+# ---- "helmet cam" style: unstable video-feed static, crackle ticks, glitchy dropouts --------------------
+def _hiss(secs, seed, lo=700, hi=4200, flutter=18.0, depth=0.55):
+    """Band-limited static whose level wobbles irregularly, like a weak signal."""
+    r = np.random.default_rng(seed)
+    n = int(secs * SR)
+    x = band(r.standard_normal(n), lo, hi)
+    wob = sosfilt(butter(2, flutter, btype="low", fs=SR, output="sos"), r.standard_normal(n))
+    wob = wob / (np.abs(wob).max() + 1e-9)
+    return x * (1 - depth + depth * (0.5 + 0.5 * wob))
+
+
+def _ticks(secs, seed, rate=260, gain=1.0):
+    """Sparse crackle: tiny decaying clicks at random times (Poisson)."""
+    r = np.random.default_rng(seed)
+    n = int(secs * SR)
+    y = np.zeros(n)
+    k = int(0.0018 * SR)
+    shape = np.exp(-np.linspace(0, 6, k))
+    for i in np.where(r.random(n) < rate / SR)[0]:
+        m = min(k, n - i)
+        y[i:i + m] += (r.random() * 2 - 1) * shape[:m] * gain * (0.4 + r.random())
+    return y
+
+
+def _gate(n, pattern, seed, smooth=0.004):
+    """Dropout mask: pattern is a list of (seconds, level) pieces, smoothed so the cuts are not clicks."""
+    m = np.concatenate([np.full(int(sec * SR), lvl, float) for sec, lvl in pattern])
+    m = np.pad(m, (0, max(0, n - len(m))), constant_values=m[-1])[:n]
+    k = max(1, int(smooth * SR))
+    return np.convolve(m, np.ones(k) / k, mode="same")
+
+
+def _beep(f, secs, drive=2.2, attack=0.012, release=0.03):
+    drive = 1.0 + (drive - 1.0) * SOFT["drive"]
+    t = tone(f, secs, harm=(1, 0, 0.3 * (0.4 + 0.6 * SOFT["drive"])), attack=max(attack, SOFT["attack"]),
+             release=max(release, SOFT["attack"] * 1.5))
+    return np.tanh(t * drive) / np.tanh(drive)
+
+
+def _cam(y, seed, hiss_level=0.28, tick_rate=240, cutoff=3800):
+    n = len(y)
+    cutoff *= SOFT["cut"]
+    mix = y + _hiss(n / SR, seed) * hiss_level * SOFT["hiss"] + _ticks(n / SR, seed + 1, tick_rate * SOFT["tick"], 0.5)
+    k = int(max(0.03, SOFT["attack"] * 1.6) * SR)       # soft start
+    mix[:k] *= np.sin(np.linspace(0, np.pi / 2, k)) ** 2
+    mix = sosfilt(butter(4, cutoff, btype="low", fs=SR, output="sos"), mix)
+    return finish(band(mix, 350, cutoff * 1.1))
+
+
+def cam_comms():
+    """Static opens, three flat distorted beeps with crackle riding over them, a short hiss tail."""
+    parts = [np.zeros(int(0.10 * SR))]
+    for _ in range(3):
+        parts += [_beep(950, 0.075), np.zeros(int(0.06 * SR))]
+    y = np.concatenate(parts[:-1])
+    y = np.concatenate([y, np.zeros(int(0.09 * SR))])
+    return _cam(y, 61, hiss_level=0.32)
+
+
+def cam_ack():
+    """Static pop, two quick blips, one dropout glitch between them."""
+    y = np.concatenate([np.zeros(int(0.06 * SR)), _beep(820, 0.06), np.zeros(int(0.04 * SR)),
+                        _beep(820, 0.09), np.zeros(int(0.08 * SR))])
+    y *= _gate(len(y), [(0.19, 1), (0.015, 0.0), (0.05, 1)], 0)
+    return _cam(y, 62, hiss_level=0.30)
+
+
+def cam_incoming():
+    """Hiss swells in with stutter dropouts, then one distorted tone that snaps to static."""
+    n = int(0.14 * SR)
+    swell = np.zeros(n)
+    y = np.concatenate([swell, np.zeros(int(0.02 * SR)), _beep(780, 0.12, drive=2.8, attack=0.02),
+                        np.zeros(int(0.08 * SR))])
+    hiss = _hiss(len(y) / SR, 63, depth=0.7) * 0.5 * SOFT["hiss"]
+    ramp = np.concatenate([np.linspace(0.1, 1, n) ** 2, np.ones(len(y) - n)])
+    hiss *= ramp * _gate(len(y), [(0.04, 1), (0.012, 0.15), (0.03, 1), (0.01, 0.1), (0.5, 1)], 0)
+    mix = y + hiss + _ticks(len(y) / SR, 64, 300 * SOFT["tick"], 0.5)
+    k = int(max(0.03, SOFT["attack"] * 1.6) * SR)
+    mix[:k] *= np.sin(np.linspace(0, np.pi / 2, k)) ** 2
+    cut = 3800 * SOFT["cut"]
+    mix = sosfilt(butter(4, cut, btype="low", fs=SR, output="sos"), mix)
+    return finish(band(mix, 350, cut * 1.1))
+
+
+def cam_disconnect():
+    """A tone sags, the feed stutters out through hiss, and ends on one dull thump (signal lost)."""
+    tn = tone(640, 0.14, 330, harm=(1, 0, 0.25), attack=0.03, release=0.05)
+    y = np.concatenate([tn, np.zeros(int(0.31 * SR))])
+    hiss = _hiss(len(y) / SR, 65, depth=0.65) * 0.55 * SOFT["hiss"]
+    hiss *= _gate(len(y), [(0.10, 1), (0.02, 0.2), (0.04, 1), (0.025, 0.1), (0.05, 0.8), (0.03, 0.0), (0.04, 0.5)],
+                  0)
+    thump = np.zeros(len(y))
+    t0, kk = int(0.38 * SR), int(0.05 * SR)
+    thump[t0:t0 + kk] = np.sin(2 * np.pi * 95 * np.arange(kk) / SR) * np.linspace(1, 0, kk) ** 2 * 0.5 * SOFT["thump"]
+    mix = y + hiss + _ticks(len(y) / SR, 66, 280 * SOFT["tick"], 0.5) + thump
+    k = int(max(0.03, SOFT["attack"] * 1.6) * SR)
+    mix[:k] *= np.sin(np.linspace(0, np.pi / 2, k)) ** 2
+    cut = 3600 * SOFT["cut"]
+    mix = sosfilt(butter(4, cut, btype="low", fs=SR, output="sos"), mix)
+    return finish(band(mix, 60, cut * 1.1))
+
+
+SOFT_VALUES = {"hiss": 0.30, "tick": 0.30, "drive": 0.30, "cut": 0.72, "thump": 0.45, "attack": 0.03}
+STYLE_PEAK = {"cam-soft": 0.25}                      # about -12 dBFS: gentler than the other sets (-9 dBFS)
+
+STYLES = {
+    "muffled": (("comms_check", comms_check), ("ack", acknowledgement), ("incoming", incoming),
+                ("disconnect", disconnect)),
+    "cam-soft": (("comms_check", cam_comms), ("ack", cam_ack), ("incoming", cam_incoming),
+                 ("disconnect", cam_disconnect)),
+    "cam": (("comms_check", cam_comms), ("ack", cam_ack), ("incoming", cam_incoming),
+            ("disconnect", cam_disconnect)),
+}
+
+
 def write(path, x):
     pcm = (np.clip(x, -1, 1) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as w:
@@ -205,9 +323,14 @@ if __name__ == "__main__":
                 subprocess.run(["pw-play", "--volume", "0.6", str(p)])
                 time.sleep(0.8)
         sys.exit(0)
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "ui" / "assets" / "callouts"
+    style = sys.argv[sys.argv.index("--style") + 1] if "--style" in sys.argv else "cam-soft"
+    pos = [a for i, a in enumerate(sys.argv[1:], 1) if not a.startswith("--") and sys.argv[i - 1] != "--style"]
+    out = Path(pos[0]) if pos else Path(__file__).resolve().parent.parent / "ui" / "assets" / "callouts"
     out.mkdir(parents=True, exist_ok=True)
-    for name, fn in (("comms_check", comms_check), ("ack", acknowledgement), ("incoming", incoming), ("disconnect", disconnect)):
+    if style == "cam-soft":
+        SOFT.update(SOFT_VALUES)
+    PEAK = STYLE_PEAK.get(style, PEAK)
+    for name, fn in STYLES[style]:
         x = fn()
         write(out / f"{name}.wav", x)
         print(f"{name}.wav  {len(x) / SR * 1000:.0f} ms  peak {20 * np.log10(np.abs(x).max()):.1f} dBFS")

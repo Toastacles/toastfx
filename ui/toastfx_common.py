@@ -15,6 +15,7 @@ RUN = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/toastfx-{os.getuid()}")
 PLAYING = RUN / "toastfx-sfx"                   # one file per running pw-play: name = pid, content = sound name
 HK_PID = RUN / "toastfx-hotkeys.pid"
 HK_STATUS = RUN / "toastfx-hotkeys.status"
+VOX_PID = RUN / "toastfx-vox.pid"
 SINK = "toastfx_sink"
 MIC_SOURCE = "toastfx_mic"
 
@@ -79,6 +80,12 @@ def callouts_cfg(cfg):
     slots = co.get("slots")
     if not isinstance(slots, dict):
         slots = co["slots"] = {}
+    au = co.get("auto")
+    if not isinstance(au, dict):
+        au = co["auto"] = {}
+    au["enabled"] = bool(au.get("enabled", False))                  # off until you turn it on
+    au["slot"] = au.get("slot") if au.get("slot") in CALLOUT_IDS else "ack"
+    au["sensitivity"] = _vol(au.get("sensitivity"), 0.5)
     for stray in [k for k in slots if k not in CALLOUT_IDS]:
         del slots[stray]
     for sid in CALLOUT_IDS:
@@ -247,6 +254,65 @@ def import_wav(src, dest):
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+# ---- speech detector for the auto beep ---------------------------------------------
+class SpeechGate:
+    """Decides when you have finished talking. Feed it one 20 ms level (dBFS) at a time with feed(db, muted).
+
+    feed() returns True exactly once per finished stretch of talking: after `hang` seconds of quiet that followed at
+    least `min_talk` seconds of speech. Short blips (a cough, a click, one word) never count, our own cues and
+    soundboard clips (muted=True) never count, and after a trigger it stays quiet for `refractory` seconds.
+    Everything is counted in frames, not clock time, so it behaves the same on a loaded machine.
+    """
+    FRAME = 0.02
+
+    def __init__(self, sensitivity=0.5, hang=0.7, min_talk=0.8, refractory=2.0):
+        self.hang, self.min_talk, self.refractory = hang, min_talk, refractory
+        self.set_sensitivity(sensitivity)
+        self.floor = -60.0
+        self.reset()
+
+    def set_sensitivity(self, s):
+        s = max(0.0, min(1.0, float(s)))
+        self.margin = 6.0 + 8.0 * (1.0 - s)            # dB above the room's noise floor that counts as speech
+        self.abs_min = -46.0 + 10.0 * (1.0 - s)        # and never quieter than this
+
+    def reset(self):
+        self.talking, self.lead, self.quiet, self.voiced, self.span, self.cool = False, 0, 0, 0, 0, 0
+
+    def threshold(self):
+        return max(self.floor + self.margin, self.abs_min)
+
+    def feed(self, db, muted=False):
+        if self.cool > 0:
+            self.cool -= 1
+        if muted:                                       # our own sound is playing: forget what we were hearing
+            self.reset()
+            self.cool = max(self.cool, int(0.4 / self.FRAME))
+            return False
+        active = db > self.threshold() + (3.0 if self.talking else 0.0)   # noise wobble must not keep a talk alive
+        if not self.talking and not active:             # learn the room: fall fast, rise slowly
+            self.floor = db if db < self.floor else self.floor + (db - self.floor) * 0.004
+            self.floor = max(-80.0, min(-35.0, self.floor))
+        if not self.talking:
+            self.lead = self.lead + 1 if active else max(0, self.lead - 1)
+            if self.lead >= 6 and self.cool == 0:       # 120 ms of voice: talking has started
+                self.talking, self.quiet, self.voiced, self.span = True, 0, self.lead, self.lead
+            return False
+        self.span += 1
+        if active:
+            self.quiet, self.voiced = 0, self.voiced + 1
+            return False
+        self.quiet += 1
+        if self.quiet * self.FRAME < self.hang:
+            return False
+        long_enough = self.voiced * self.FRAME >= self.min_talk
+        self.reset()
+        if long_enough:
+            self.cool = int(self.refractory / self.FRAME)
+            return True
+        return False
 
 
 # ---- key combos ---------------------------------------------------------------

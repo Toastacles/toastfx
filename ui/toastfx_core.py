@@ -174,13 +174,25 @@ class Core:
         self.bg([ctl, vid], timeout=4, done=done)
 
     def toggle_engine(self):
-        act = "stop" if self.engine else "start"
-        self.engine = not self.engine
+        """Ask systemd what is true right now, then do the opposite (the window's own idea can be a moment stale)."""
+        self.engine_hold = time.time() + 4          # ignore status polls that were already in flight
+        self.engine = not self.engine                # show the change at once
 
-        def done(r):
-            if r is not None and r.returncode != 0:
-                self.say(["Engine command", "failed"], warn=True)
-        self.bg(["systemctl", "--user", act, SERVICE], timeout=15, done=done)
+        def work():
+            try:
+                now = subprocess.run(["systemctl", "--user", "is-active", SERVICE], stdin=DEVNULL,
+                                     capture_output=True, text=True, timeout=5).stdout.strip() == "active"
+                act = "stop" if now else "start"
+                r = subprocess.run(["systemctl", "--user", act, SERVICE], stdin=DEVNULL, capture_output=True,
+                                   text=True, timeout=20)
+                self.engine = (act == "start") and r.returncode == 0
+                if r.returncode != 0:
+                    why = (r.stderr or "").strip().splitlines()[-1:] or ["failed"]
+                    self.say(["Engine " + act + " failed", why[0][:22]], warn=True, secs=6)
+            except Exception as exc:
+                self.say(["Engine command", str(exc)[:20]], warn=True)
+            self.engine_hold = time.time() + 1.5
+        threading.Thread(target=work, daemon=True).start()
 
     def play(self, name):
         self.bg([sys.executable, str(BASE / "toastfx-sfx"), "play", name], timeout=15, done=self._sfx_done)
@@ -321,6 +333,40 @@ class Core:
             return "off"
         return "on"
 
+    # ---- auto beep (plays a cue after you stop talking, Helmet mode only) ----------------------
+    def auto(self):
+        return self.co()["auto"]
+
+    def auto_status(self):
+        """(text, kind) for the Auto beep tile: kind is 'off' | 'wait' | 'armed' | 'live'."""
+        au = self.auto()
+        if not au["enabled"]:
+            return "OFF", "off"
+        if not self.co_on() or not self.slot(au["slot"])["enabled"]:
+            return "CUE IS OFF", "wait"
+        if not self.engine:
+            return "ENGINE STOPPED", "wait"
+        if self.mode != "helmet":
+            return "WAITS FOR HELMET", "armed"
+        return "LISTENING", "live"
+
+    def toggle_auto(self):
+        au = self.auto()
+        au["enabled"] = not au["enabled"]
+        save_config(self.cfg)
+        self.reload_listener()                       # the hotkeys helper starts / stops the watcher
+        self.say(["Auto beep", "ON" if au["enabled"] else "OFF"])
+
+    def set_auto_sens(self, v, save=False):
+        self.auto()["sensitivity"] = max(0.0, min(1.0, float(v)))
+        if save:
+            save_config(self.cfg)                    # the watcher re-reads this every couple of seconds
+
+    def set_auto_slot(self, sid):
+        self.auto()["slot"] = sid
+        save_config(self.cfg)
+        self.say(["Auto beep plays", CALLOUT_SHORT[sid]])
+
     def set_view(self, view):
         self.view = view
 
@@ -423,7 +469,7 @@ class Core:
         return out
 
     def apply_poll(self, d):
-        if d.get("engine") is not None:
+        if d.get("engine") is not None and time.time() >= getattr(self, "engine_hold", 0):
             was = self.engine
             self.engine = d["engine"]
             if self.engine and not was:          # engine just (re)started: it begins at 100%, so resend ours

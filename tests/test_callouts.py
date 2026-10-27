@@ -61,7 +61,7 @@ class Sandbox(unittest.TestCase):
         stub = self.bin / "pw-play"
         hold = self.bin / "pw-play-hold"                       # stands in for a running pw-play for 2 s
         shutil.copy(shutil.which("sleep"), hold)
-        stub.write_text(f'#!/bin/sh\necho "$@" >> "{self.log}"\nexec "{hold}" 2\n')
+        stub.write_text(f'#!/bin/sh\necho "$@" >> "{self.log}"\nexec "{hold}" "${{STUB_HOLD:-2}}"\n')
         stub.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), XDG_RUNTIME_DIR=str(self.run),
                         XDG_CONFIG_HOME=str(self.home / ".config"), PATH=f"{self.bin}:{os.environ['PATH']}")
@@ -114,6 +114,10 @@ class TestAssets(unittest.TestCase):
             self.assertLess(abs(data[-1]) + abs(data[-2]), 400, f"{sid} ends with a click")
 
     def test_generator_is_reproducible(self):
+        try:
+            import numpy, scipy  # only needed to regenerate the sounds, not to use them
+        except ImportError:
+            self.skipTest("numpy/scipy not installed")
         out = Path(tempfile.mkdtemp())
         try:
             subprocess.run([sys.executable, str(ROOT / "tools" / "make_callouts.py"), str(out)], check=True,
@@ -313,6 +317,181 @@ class TestMixHeadroom(unittest.TestCase):
         self.assertLess(0.9 + worst, 1.12)
 
 
+class TestSpeechGate(unittest.TestCase):
+    """The talk-ended detector, fed synthetic 20 ms levels (dBFS) with a little random wobble."""
+
+    @staticmethod
+    def run_gate(parts, seed=1, sd=2.5, **kw):
+        import random
+        rnd = random.Random(seed)
+        sys.path.insert(0, str(UI))
+        from toastfx_common import SpeechGate
+        g, hits, i = SpeechGate(**kw), [], 0
+        for seconds, db in parts:
+            for _ in range(int(seconds / 0.02)):
+                if g.feed(db + rnd.gauss(0, sd)):
+                    hits.append(round(i * 0.02, 2))
+                i += 1
+        return hits
+
+    def many(self, parts, want, runs=25, **kw):
+        bad = [sd for sd in range(runs) if len(self.run_gate(parts, seed=sd, **kw)) != want]
+        self.assertFalse(bad, f"wrong number of beeps (wanted {want}) for seeds {bad}")
+
+    def test_one_beep_after_a_normal_stretch_of_talking(self):
+        self.many([(2, -62), (1.5, -26), (2, -62)], 1)
+
+    def test_blip_or_cough_is_ignored(self):
+        self.many([(2, -62), (0.3, -26), (2, -62)], 0)
+
+    def test_short_pause_between_phrases_is_not_the_end(self):
+        self.many([(2, -62), (1.2, -26), (0.4, -62), (1.2, -26), (2, -62)], 1)
+
+    def test_steady_background_noise_never_triggers(self):
+        self.many([(10, -45)], 0)
+        self.many([(10, -35)], 0)
+
+    def test_speech_over_a_noisy_room(self):
+        self.many([(3, -45), (1.5, -25), (3, -45)], 1)
+
+    def test_two_separate_talks_give_two_beeps(self):
+        self.many([(2, -62), (1.5, -26), (3, -62), (1.2, -26), (2, -62)], 2)
+
+    def test_refractory_blocks_a_second_beep_right_away(self):
+        self.many([(2, -62), (1.5, -26), (0.9, -62), (1.2, -26), (2, -62)], 1, refractory=3.0)
+
+    def test_sensitivity_changes_what_counts_as_quiet_speech(self):
+        whisper = [(2, -62), (1.5, -38), (2, -62)]
+        self.many(whisper, 0, sensitivity=0.0)
+        self.many(whisper, 1, sensitivity=1.0)
+
+    def test_our_own_sounds_are_not_speech(self):
+        sys.path.insert(0, str(UI))
+        from toastfx_common import SpeechGate
+        g = SpeechGate()
+        fired = [g.feed(-26.0, muted=True) for _ in range(200)] + [g.feed(-62.0) for _ in range(200)]
+        self.assertFalse(any(fired))
+
+
+class TestAutoBeepWatcher(Sandbox):
+    """Runs the real toastfx-vox with a fake parec (synthetic speech), journalctl (voice mode) and pw-play."""
+
+    def fake_tools(self, mode_text, pcm_script):
+        (self.bin / "journalctl").write_text(f'#!/bin/sh\necho "{mode_text}"\n')
+        (self.bin / "parec").write_text(f"#!{sys.executable}\n{pcm_script}\n")
+        for n in ("journalctl", "parec"):
+            (self.bin / n).chmod(0o755)
+
+    SPEECH = """
+import random, struct, sys, time
+random.seed(3)
+def block(db):
+    amp = 32768 * 10 ** (db / 20) * 1.7
+    return b"".join(struct.pack("<h", int(max(-32768, min(32767, random.gauss(0, amp))))) for _ in range(320))
+plan = [(1.0, -66), (1.4, -28), (2.2, -66), (0.3, -28), (2.2, -66), (1.2, -28), (2.5, -66)]
+for secs, db in plan:
+    for _ in range(int(secs / 0.02)):
+        sys.stdout.buffer.write(block(db)); sys.stdout.buffer.flush(); time.sleep(0.008)   # 2.5x real time
+time.sleep(30)
+"""
+
+    def run_watcher(self, secs=14):
+        env = dict(self.env, STUB_HOLD="0.3")                      # a cue "plays" for 0.3 s, like the real ones
+        p = subprocess.Popen([sys.executable, str(UI / "toastfx-vox")], env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE)
+        time.sleep(secs)
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        p.stderr.close()
+        return p
+
+    def enable(self, **kw):
+        def f(co, cfg):
+            co["auto"].update(dict(enabled=True, slot="ack", **kw))
+        self.set_cfg(f)
+
+    def test_beeps_after_each_real_talk_in_helmet_mode_only_once_each(self):
+        self.fake_tools("Mode: Helmet Comms", self.SPEECH)
+        self.enable()
+        self.run_watcher()
+        lines = self.plays()
+        self.assertEqual(len(lines), 2, f"two real talks, one blip: {lines}")
+        self.assertTrue(all("--target toastfx_sink" in l and "ack.wav" in l for l in lines))
+        self.assertFalse((self.run / "toastfx-vox.pid").exists(), "pid file is cleaned up on exit")
+
+    def test_no_beep_in_other_voice_modes(self):
+        for mode in ("Mode: Dry Mic", "Mode: Radio", "Mode: Robot"):
+            self.fake_tools(mode, self.SPEECH)
+            self.enable()
+            self.run_watcher(secs=6)
+            self.assertEqual(len(self.plays()), 0, mode)
+
+    def test_off_by_default_and_respects_the_master_and_cue_switches(self):
+        self.fake_tools("Mode: Helmet Comms", self.SPEECH)
+        self.run_watcher(secs=6)                                   # Auto beep never turned on
+        self.assertEqual(len(self.plays()), 0)
+        self.enable()
+        self.set_cfg(lambda co, cfg: co.__setitem__("enabled", False))
+        self.run_watcher(secs=6)
+        self.assertEqual(len(self.plays()), 0, "callout master switch off")
+        self.set_cfg(lambda co, cfg: (co.__setitem__("enabled", True), co["slots"]["ack"].__setitem__("enabled", False)))
+        self.run_watcher(secs=6)
+        self.assertEqual(len(self.plays()), 0, "the chosen cue is switched off")
+
+    def test_silent_while_a_soundboard_clip_is_playing(self):
+        self.fake_tools("Mode: Helmet Comms", self.SPEECH)
+        self.enable()
+        (self.C.PLAYING).mkdir(parents=True, exist_ok=True)
+        hold = subprocess.Popen([str(self.bin / "pw-play-hold"), "20"])
+        (self.C.PLAYING / str(hold.pid)).write_text("airhorn")
+        try:
+            self.run_watcher(secs=9)
+        finally:
+            hold.terminate()
+        self.assertEqual(len(self.plays()), 0, "a clip passing through the mic is not you talking")
+
+    def test_second_copy_exits_quietly(self):
+        self.fake_tools("Mode: Helmet Comms", self.SPEECH)
+        self.enable()
+        first = subprocess.Popen([sys.executable, str(UI / "toastfx-vox")], env=self.env, stdout=subprocess.DEVNULL)
+        time.sleep(1.5)
+        second = subprocess.run([sys.executable, str(UI / "toastfx-vox")], env=self.env, timeout=10)
+        first.terminate()
+        first.wait(timeout=5)
+        self.assertEqual(second.returncode, 0)
+
+    def test_hotkeys_helper_starts_and_stops_the_watcher(self):
+        self.fake_tools("Mode: Dry Mic", "import time\ntime.sleep(60)")
+        loader = importlib.machinery.SourceFileLoader("hk", str(UI / "toastfx-hotkeys"))
+        spec = importlib.util.spec_from_loader("hk", loader)
+        hk = importlib.util.module_from_spec(spec)
+        loader.exec_module(hk)
+        vox = hk.Vox()
+        vox.sync()
+        self.assertIsNone(vox.proc, "Auto beep is off: nothing runs")
+        self.enable()
+        vox.sync()
+        self.assertIsNotNone(vox.proc)
+        time.sleep(1.5)
+        self.assertTrue((self.run / "toastfx-vox.pid").exists(), "the watcher is up")
+        self.set_cfg(lambda co, cfg: co["auto"].__setitem__("enabled", False))
+        vox.sync()
+        self.assertIsNone(vox.proc, "switched off: the watcher is stopped")
+        time.sleep(0.5)
+        self.assertFalse((self.run / "toastfx-vox.pid").exists())
+
+    def test_quiet_flag_means_no_desktop_note(self):
+        (self.bin / "notify-send").write_text(f'#!/bin/sh\necho note >> "{self.tmp}/notes.log"\n')
+        (self.bin / "notify-send").chmod(0o755)
+        self.sfx("callout", "ack")
+        time.sleep(0.6)
+        self.sfx("callout", "ack", "--quiet")
+        self.assertEqual((self.tmp / "notes.log").read_text().count("note"), 1, "only the non-quiet call notified")
+
+
 @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb not installed")
 class TestHotkeys(Sandbox):
     def test_keys(self):
@@ -481,6 +660,29 @@ class TestWindow(Sandbox):
         junk.write_bytes(b"x" * 50)
         self.core.replace_slot("ack", junk, wait=True)
         self.assertEqual(self.core.hint()[0][0], "Can't use that:")
+
+
+    def test_auto_beep_tile(self):
+        self.click("tab", "callouts")
+        self.assertFalse(self.core.auto()["enabled"], "off until switched on")
+        self.assertEqual(self.core.auto_status()[1], "off")
+        with mock.patch.object(self.core, "reload_listener") as rl:
+            self.click("auto_switch")
+            self.assertTrue(self.core.auto()["enabled"])
+            rl.assert_called()
+        self.core.engine, self.core.mode = True, "radio"
+        self.assertEqual(self.core.auto_status()[1], "armed", "waits for Helmet")
+        self.core.mode = "helmet"
+        self.assertEqual(self.core.auto_status(), ("LISTENING", "live"))
+        self.click("co_master")                                    # callout master off
+        self.assertEqual(self.core.auto_status()[1], "wait")
+        e = self.click("auto_sens", dx=1.0)
+        self.app.on_release(e)
+        saved = json.loads((self.C.CONF_DIR / "config.json").read_text())["callouts"]["auto"]
+        self.assertTrue(saved["enabled"])
+        self.assertGreater(saved["sensitivity"], 0.9)
+        self.core.set_auto_slot("incoming")
+        self.assertEqual(self.core.auto()["slot"], "incoming")
 
     def test_hotkey_badge_assignment(self):
         self.click("tab", "callouts")

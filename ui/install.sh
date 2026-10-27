@@ -23,8 +23,8 @@ mkdir -p "$DEST" "$BIN" "$AUTO" "$APPS"
 rm -rf "$DEST/assets"
 cp -r "$HERE/assets" "$DEST/assets"
 cp "$HERE"/toastfx_common.py "$HERE"/toastfx_core.py "$HERE"/toastfx_ui.py \
-   "$HERE"/toastfx-control "$HERE"/toastfx-sfx "$HERE"/toastfx-hotkeys "$DEST/"
-chmod +x "$DEST"/toastfx-control "$DEST"/toastfx-sfx "$DEST"/toastfx-hotkeys
+   "$HERE"/toastfx-control "$HERE"/toastfx-sfx "$HERE"/toastfx-hotkeys "$HERE"/toastfx-vox "$DEST/"
+chmod +x "$DEST"/toastfx-control "$DEST"/toastfx-sfx "$DEST"/toastfx-hotkeys "$DEST"/toastfx-vox
 
 # the voice switcher the window and hotkeys call
 CTL=""

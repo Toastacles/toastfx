@@ -28,7 +28,7 @@ chmod 755 "$ROOT/usr/bin/toastfx"
 echo "== Window, soundboard, hotkeys =="
 cp -r "$REPO/ui/." "$ROOT/usr/lib/toastfx/ui/"
 rm -f "$ROOT/usr/lib/toastfx/ui/install.sh" "$ROOT/usr/lib/toastfx/ui/uninstall.sh"
-chmod 755 "$ROOT"/usr/lib/toastfx/ui/toastfx-control "$ROOT"/usr/lib/toastfx/ui/toastfx-sfx "$ROOT"/usr/lib/toastfx/ui/toastfx-hotkeys
+chmod 755 "$ROOT"/usr/lib/toastfx/ui/toastfx-control "$ROOT"/usr/lib/toastfx/ui/toastfx-sfx "$ROOT"/usr/lib/toastfx/ui/toastfx-hotkeys "$ROOT"/usr/lib/toastfx/ui/toastfx-vox
 find "$ROOT/usr/lib/toastfx/ui" -type f ! -name 'toastfx-*' -exec chmod 644 {} +
 for t in toastfx-control toastfx-sfx toastfx-hotkeys; do
   ln -s "../lib/toastfx/ui/$t" "$ROOT/usr/bin/$t"
@@ -131,6 +131,7 @@ cat > "$ROOT/DEBIAN/prerm" <<'D'
 #!/bin/sh
 set -e
 pkill -x toastfx-hotkeys 2>/dev/null || true
+pkill -f toastfx-vox 2>/dev/null || true
 exit 0
 D
 chmod 755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm"
