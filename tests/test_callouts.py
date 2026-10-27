@@ -673,6 +673,8 @@ class TestWindow(Sandbox):
         self.core.engine, self.core.mode = True, "radio"
         self.assertEqual(self.core.auto_status()[1], "armed", "waits for Helmet")
         self.core.mode = "helmet"
+        self.assertEqual(self.core.auto_status(), ("WATCHER NOT RUNNING", "wait"), "no watcher, no LISTENING")
+        self.core.vox_on = True
         self.assertEqual(self.core.auto_status(), ("LISTENING", "live"))
         self.click("co_master")                                    # callout master off
         self.assertEqual(self.core.auto_status()[1], "wait")

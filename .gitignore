@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 tools/*_check.png
 !ui/assets/callouts/*.wav
+!ui/assets/callouts/*.wav

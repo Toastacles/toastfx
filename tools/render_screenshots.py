@@ -67,6 +67,7 @@ core.engine, core.mode, core.hk_on, core.level = True, "helmet", True, 0.58
 core.pw_detail = "PipeWire · ToastFX Mic"
 core.cfg["monitor"] = False
 core.auto()["enabled"] = True
+core.vox_on = True
 
 
 def snap(name):

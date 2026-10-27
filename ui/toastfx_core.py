@@ -67,6 +67,7 @@ class Core:
         self.flash = None                 # (lines, until) short-lived message for the hint box
         self.hk_failed = []
         self.hk_on = False
+        self.vox_on = False               # the auto-beep watcher process is really running
         self.pw_detail = "PipeWire"
         self.lock = threading.Lock()
         self._ensure_icons()
@@ -348,6 +349,8 @@ class Core:
             return "ENGINE STOPPED", "wait"
         if self.mode != "helmet":
             return "WAITS FOR HELMET", "armed"
+        if not self.vox_on:
+            return "WATCHER NOT RUNNING", "wait"
         return "LISTENING", "live"
 
     def toggle_auto(self):
@@ -465,6 +468,11 @@ class Core:
                 out["mode"] = None
         out["playing"] = set(players().values())
         out["hk_on"] = listener_pid() is not None
+        try:
+            v = VOX_PID.read_text().strip()
+            out["vox_on"] = v.isdigit() and pid_alive(int(v), "toastfx-vox")
+        except OSError:
+            out["vox_on"] = False
         out["hk_failed"] = (read_json(HK_STATUS, {}) or {}).get("failed", [])
         return out
 
@@ -478,6 +486,7 @@ class Core:
             self.mode = d["mode"]
         self.playing = d.get("playing", set())
         self.hk_on = d.get("hk_on", False)
+        self.vox_on = d.get("vox_on", False)
         self.hk_failed = d.get("hk_failed", [])
 
     def load_versions(self):

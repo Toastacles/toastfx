@@ -28,7 +28,8 @@ from toastfx_core import parse_mode
 RATE, FRAME_BYTES = 16000, 640                    # 20 ms of mono s16le
 DEVNULL = subprocess.DEVNULL
 POLL = 2.0                                        # seconds between config / voice-mode checks
-state = {"quit": False, "want": False, "sens": 0.5, "slot": "ack"}
+state = {"quit": False, "want": False, "sens": 0.5, "slot": "ack", "why": "starting", "mode": None}
+DEBUG = "--debug" in sys.argv                     # print what it hears; run it by hand: toastfx-vox --debug
 
 
 def on_signal(_sig, _frame):
@@ -52,9 +53,17 @@ def poller():
             au = co["auto"]
             state["sens"], state["slot"] = au["sensitivity"], au["slot"]
             on = au["enabled"] and co["enabled"] and co["slots"][au["slot"]]["enabled"]
-            state["want"] = bool(on and current_mode() == "helmet")
-        except Exception:
+            mode = current_mode() if on else None
+            state["mode"] = mode
+            state["want"] = bool(on and mode == "helmet")
+            state["why"] = ("listening" if state["want"] else
+                            "Auto beep is off" if not au["enabled"] else
+                            "callout soundboard is off" if not co["enabled"] else
+                            "the chosen cue is switched off" if not co["slots"][au["slot"]]["enabled"] else
+                            f"voice is not Helmet Comms (journal says: {mode})")
+        except Exception as exc:
             state["want"] = False
+            state["why"] = f"config error: {exc}"
         for _ in range(int(POLL / 0.1)):
             if state["quit"]:
                 return
@@ -96,11 +105,12 @@ def main():
     if not shutil.which("parec"):
         print("toastfx-vox: parec not found (sudo apt install pulseaudio-utils)", file=sys.stderr)
         return 1
-    old = VOX_PID.read_text().strip() if VOX_PID.exists() else ""
-    if old.isdigit() and int(old) != os.getpid() and pid_alive(int(old), "toastfx-vox"):
-        return 0                                   # already running
-    RUN.mkdir(parents=True, exist_ok=True)
-    VOX_PID.write_text(str(os.getpid()))
+    if not DEBUG:                                  # a --debug copy runs next to the real one and never touches its pid file
+        old = VOX_PID.read_text().strip() if VOX_PID.exists() else ""
+        if old.isdigit() and int(old) != os.getpid() and pid_alive(int(old), "toastfx-vox"):
+            return 0                               # already running
+        RUN.mkdir(parents=True, exist_ok=True)
+        VOX_PID.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     try:
@@ -110,22 +120,28 @@ def main():
         pass
     threading.Thread(target=poller, daemon=True).start()
     gate, proc, buf, last_busy, check = SpeechGate(state["sens"]), None, b"", 0.0, 0.0
-    print("toastfx-vox running", flush=True)
+    print("toastfx-vox running" + (" (debug: showing levels)" if DEBUG else ""), flush=True)
+    frames, last_why = 0, None
     try:
         while not state["quit"]:
-            if state["want"] and proc is None:
+            listen = state["want"] or DEBUG                  # --debug always listens so you can see the levels
+            if listen and proc is None:
                 try:
                     proc, buf = start_parec(), b""
                     gate = SpeechGate(state["sens"])
                 except OSError:
                     proc = None
                     time.sleep(1)
-            elif not state["want"] and proc is not None:
+            elif not listen and proc is not None:
                 stop_parec(proc)
                 proc = None
             if proc is None:
+                if DEBUG and state["why"] != last_why:
+                    last_why = state["why"]
+                    print(f"not listening: {last_why}", flush=True)
                 time.sleep(0.2)
                 continue
+            last_why = None
             ready, _, _ = select.select([proc.stdout], [], [], 0.25)
             if not ready:
                 if proc.poll() is not None:
@@ -150,12 +166,23 @@ def main():
                     if busy():
                         last_busy = now
                 muted = now - last_busy < 0.5       # a clip is playing or just ended
-                if gate.feed(db, muted):
-                    fire(state["slot"])
+                fired = gate.feed(db, muted)
+                frames += 1
+                if DEBUG and frames % 10 == 0:               # five lines a second
+                    bar = "#" * max(0, min(40, int((db + 70) / 70 * 40)))
+                    print(f"{db:6.1f} dB  floor {gate.floor:6.1f}  need > {gate.threshold():6.1f}  "
+                          f"{'TALKING ' if gate.talking else '        '}{'(own sound playing) ' if muted else ''}{bar}",
+                          flush=True)
+                if fired:
+                    if DEBUG:
+                        print(f">>> finished talking: " + (f"playing {state['slot']}" if state["want"] else
+                              f"would NOT play, because {state['why']}"), flush=True)
+                    if state["want"]:
+                        fire(state["slot"])
     finally:
         stop_parec(proc)
         try:
-            if VOX_PID.read_text().strip() == str(os.getpid()):
+            if not DEBUG and VOX_PID.read_text().strip() == str(os.getpid()):
                 VOX_PID.unlink()
         except OSError:
             pass
