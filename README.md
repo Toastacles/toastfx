@@ -19,7 +19,7 @@ Real-time voice changer and soundboard for Linux (PipeWire), built for games and
 2. Open a terminal in your Downloads folder and run:
 
    ```bash
-   sudo apt install ./toastfx_1.0.0_*.deb
+   sudo apt install ./toastfx_1.0.0_amd64.deb
    ```
 
    If the downloaded filename differs, replace the wildcard pattern with the actual filename.
@@ -33,7 +33,7 @@ sudo apt install build-essential pkg-config libpipewire-0.3-dev
 git clone https://github.com/Toastacles/toastfx.git
 cd toastfx
 ./packaging/build-deb.sh
-sudo apt install ./packaging/toastfx_1.0.0_*.deb
+sudo apt install ./packaging/toastfx_1.0.0_amd64.deb
 ```
 
 **Note:** If APT reports a sandbox warning when installing a locally built package, copy the `.deb` to a directory accessible to APT, such as `/tmp`, and install it from there.
