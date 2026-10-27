@@ -114,10 +114,6 @@ class TestAssets(unittest.TestCase):
             self.assertLess(abs(data[-1]) + abs(data[-2]), 400, f"{sid} ends with a click")
 
     def test_generator_is_reproducible(self):
-        try:
-            import numpy, scipy  # only needed to regenerate the sounds, not to use them
-        except ImportError:
-            self.skipTest("numpy/scipy not installed")
         out = Path(tempfile.mkdtemp())
         try:
             subprocess.run([sys.executable, str(ROOT / "tools" / "make_callouts.py"), str(out)], check=True,
@@ -227,11 +223,13 @@ class TestSfxCommand(Sandbox):
         self.assertEqual([sid in l for sid, l in zip(SLOTS, self.plays())], [True] * 4)
 
     def test_key_repeat_is_swallowed_then_allowed(self):
+        # a 2 s window so a loaded machine (slow process start-up) cannot make a "repeat" look like a new press
+        self.env["TOASTFX_CALLOUT_DEBOUNCE"] = "2"
         self.sfx("callout", "ack")
         for _ in range(3):
             self.assertEqual(self.sfx("callout", "ack").returncode, 0)
         self.assertEqual(len(self.plays()), 1)
-        time.sleep(self.C.CALLOUT_DEBOUNCE + 0.1)
+        time.sleep(2.2)
         self.sfx("callout", "ack")
         self.assertEqual(len(self.plays()), 2)
 
