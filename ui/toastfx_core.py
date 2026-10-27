@@ -50,11 +50,15 @@ def keysym_to_combo(keysym, state, ctrl_mask=0x4, alt_mask=0x8, shift_mask=0x1, 
     return make_combo(mods, key)
 
 
+EXIT_MISSING_CODE = 3
+
+
 class Core:
     def __init__(self):
         self.cfg = load_config()
         self.lib = load_library()
         self.page = 0
+        self.view = "board"               # "board" (sound tiles) or "callouts"
         self.mode = "dry"                 # the engine always starts in Dry Mic
         self.engine = False
         self.playing = set()              # names of sounds playing right now
@@ -121,6 +125,28 @@ class Core:
         save_config(self.cfg)
         self.reload_listener()
         self.page = max(0, min(self.page, self.pages() - 1))
+
+    def rename_sound(self, old, new):
+        """Returns an error message, or None on success."""
+        new = (new or "").strip()[:40]
+        if not new:
+            return "Name can't be empty"
+        if new == old:
+            return None
+        if any(s["name"].lower() == new.lower() for s in self.lib if s["name"] != old):
+            return "That name is already used"
+        for sound in self.lib:
+            if sound["name"] == old:
+                sound["name"] = new
+        save_library(self.lib)
+        hk = self.cfg["hotkeys"]
+        if "sound:" + old in hk:
+            hk["sound:" + new] = hk.pop("sound:" + old)
+        if old in self.cfg["icons"]:
+            self.cfg["icons"][new] = self.cfg["icons"].pop(old)
+        save_config(self.cfg)
+        self.reload_listener()
+        return None
 
     # ---- actions --------------------------------------------------------------------
     def bg(self, argv, timeout=8, done=None):
@@ -209,7 +235,7 @@ class Core:
             os.close(fd)
 
     def toggle_monitor(self):
-        self.cfg["monitor"] = not self.cfg.get("monitor", True)
+        self.cfg["monitor"] = not self.cfg.get("monitor", False)
         save_config(self.cfg)
 
     # ---- hotkeys --------------------------------------------------------------------
@@ -224,6 +250,8 @@ class Core:
 
     def label_of(self, target):
         kind, _, arg = target.partition(":")
+        if kind == "callout":
+            return CALLOUT_SHORT.get(arg, arg)
         return VOICE_LABELS.get(arg, arg) if kind == "voice" else arg
 
     def begin_listen(self, target):
@@ -254,6 +282,10 @@ class Core:
         if not parsed or not combo_ok(*parsed):
             self.say(["Add Ctrl, Alt", "or Shift"], warn=True)
             return False
+        mods, key = parsed
+        if "Ctrl" in mods and "Alt" in mods and key.upper() in {f"F{i}" for i in range(1, 13)}:
+            self.say(["Ctrl+Alt+F1-12", "switch consoles"], warn=True)       # the X server eats these before any app
+            return False
         stolen = [t for t, c in self.cfg["hotkeys"].items() if c == combo and t != target]
         for t in stolen:
             del self.cfg["hotkeys"][t]
@@ -268,6 +300,83 @@ class Core:
         self.cfg["hotkeys"].pop(target, None)
         save_config(self.cfg)
         self.end_listen()
+
+    # ---- squad callouts ---------------------------------------------------------------
+    def co(self):
+        return callouts_cfg(self.cfg)
+
+    def co_on(self):
+        return self.co()["enabled"]
+
+    def slot(self, sid):
+        return self.co()["slots"][sid]
+
+    def slot_state(self, sid):
+        """'playing' | 'unavailable' | 'off' | 'on' (what the tile shows)."""
+        if ("callout:" + sid) in self.playing:
+            return "playing"
+        if callout_file(sid) is None:
+            return "unavailable"
+        if not self.co_on() or not self.slot(sid)["enabled"]:
+            return "off"
+        return "on"
+
+    def set_view(self, view):
+        self.view = view
+
+    def toggle_callouts(self):
+        c = self.co()
+        c["enabled"] = not c["enabled"]
+        save_config(self.cfg)
+        self.reload_listener()                       # a switched-off soundboard gives its keys back
+        self.say(["Callouts " + ("ON" if c["enabled"] else "OFF")])
+
+    def toggle_slot(self, sid):
+        sl = self.slot(sid)
+        sl["enabled"] = not sl["enabled"]
+        save_config(self.cfg)
+        self.reload_listener()
+        self.say([CALLOUT_SHORT[sid], "ON" if sl["enabled"] else "OFF"])
+
+    def set_co_volume(self, v, sid=None, save=False):
+        v = max(0.0, min(1.0, float(v)))
+        (self.slot(sid) if sid else self.co())["volume"] = v
+        if save:
+            save_config(self.cfg)
+
+    def play_callout(self, sid):
+        """Same path the hotkey uses, so the window and the key behave identically (including every check)."""
+        if not self.co_on():
+            self.say(["Callouts are", "switched off"], warn=True)
+            return
+        if not self.slot(sid)["enabled"]:
+            self.say([CALLOUT_SHORT[sid], "is off"], warn=True)
+            return
+        self.bg([sys.executable, str(BASE / "toastfx-sfx"), "callout", sid], timeout=10, done=self._callout_done)
+
+    def _callout_done(self, r):
+        if r is not None and r.returncode == EXIT_MISSING_CODE:
+            self.say(["Sound missing", "or unreadable"], warn=True)
+
+    def replace_slot(self, sid, path, wait=False):
+        """Convert + store a WAV for a slot. Runs in a thread (a long file takes a moment in pure Python)."""
+        def work():
+            err = import_wav(path, CALLOUT_DIR / f"{sid}.wav")
+            if err:
+                self.say(["Can't use that:", err[:22]], warn=True, secs=6)
+            else:
+                self.say([CALLOUT_SHORT[sid], "replaced"])
+            self.replaced = err
+        self.say(["Converting", "your WAV..."])
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        if wait:
+            t.join()
+        return t
+
+    def reset_slot(self, sid):
+        callout_reset(sid)
+        self.say([CALLOUT_SHORT[sid], "back to default"])
 
     # ---- hint box -------------------------------------------------------------------
     def say(self, lines, warn=False, secs=3.0):
@@ -351,9 +460,9 @@ class MeterReader(threading.Thread):
             try:
                 self.proc = subprocess.Popen(
                     ["parec", f"--device={MIC_SOURCE}", "--raw", "--format=s16le", "--rate=24000", "--channels=1",
-                     "--latency-msec=40"], stdout=subprocess.PIPE, stderr=DEVNULL, bufsize=0)
+                     "--latency-msec=20"], stdout=subprocess.PIPE, stderr=DEVNULL, bufsize=0)
                 while not self.stop_flag:
-                    raw = self.proc.stdout.read(2048)
+                    raw = self.proc.stdout.read(960)
                     if not raw:
                         break
                     s = array.array("h")
@@ -362,7 +471,7 @@ class MeterReader(threading.Thread):
                         rms = math.sqrt(sum(v * v for v in s) / len(s))
                         lvl = min(1.0, math.sqrt(rms / 9000.0))
                         old = self.core.level
-                        self.core.level = lvl if lvl > old else old * 0.82 + lvl * 0.18
+                        self.core.level = lvl if lvl > old else old * 0.86 + lvl * 0.14
             except Exception:
                 pass
             self.core.level = 0.0

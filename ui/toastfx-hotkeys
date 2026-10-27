@@ -96,6 +96,8 @@ def action_command(action):
         return [ctl, arg]
     if kind == "sound" and arg:
         return [sys.executable, sfx, "play", arg]
+    if kind == "callout" and arg in CALLOUT_IDS:
+        return [sys.executable, sfx, "callout", arg]
     if action == "stop:all":
         return [sys.executable, sfx, "stop"]
     return None
@@ -152,7 +154,13 @@ def main():
         release()
         failed, ok = [], 0
         if not state["pause"]:
-            for action, combo in load_config()["hotkeys"].items():
+            cfg = load_config()
+            co = callouts_cfg(cfg)
+            for action, combo in cfg["hotkeys"].items():
+                if action.startswith("callout:"):       # disabled callouts don't hold a key hostage
+                    sid = action.partition(":")[2]
+                    if not co["enabled"] or not co["slots"].get(sid, {}).get("enabled", False):
+                        continue
                 parsed = parse_combo(combo)
                 if not parsed or not combo_ok(*parsed) or not action_command(action):
                     continue
@@ -181,6 +189,7 @@ def main():
 
     print("toastfx-hotkeys running", flush=True)
     ev = XEvent()
+    last_seen = {}        # callout action -> time of its latest key event (repeat guard)
     try:
         while not state["quit"]:
             if state["reload"]:
@@ -191,6 +200,12 @@ def main():
                 x11.XNextEvent(dpy, ctypes.byref(ev))
                 if ev.type == KEY_PRESS:
                     action = table.get((ev.xkey.keycode, ev.xkey.state & RELEVANT))
+                    if action and action.startswith("callout:"):
+                        now = time.monotonic()
+                        quiet = now - last_seen.get(action, -9.0)
+                        last_seen[action] = now          # every repeat refreshes it, so holding the key stays quiet
+                        if quiet < CALLOUT_REPEAT_GAP:
+                            continue
                     if action:
                         argv = action_command(action)
                         if argv:

@@ -6,9 +6,19 @@
   toastfx-sfx list              show the library
   toastfx-sfx add FILE [NAME]   add a clip to the library
   toastfx-sfx test              play two test tones, one after the other overlapping
+
+Squad callouts (four cues; each has its own on/off, volume and optional key; see docs/CALLOUTS.md):
+  toastfx-sfx callout SLOT      play one: comms_check | ack | incoming | disconnect
+  toastfx-sfx callouts          show status of the master switch and the four slots
+  toastfx-sfx callout-replace SLOT FILE.wav   use your own WAV for a slot (converted to 48 kHz stereo)
+  toastfx-sfx callout-reset SLOT              go back to the shipped sound
+  toastfx-sfx callouts-on | callouts-off      master switch for the whole callout soundboard
 """
+EXIT_OFF, EXIT_MISSING = 2, 3
 import hashlib
 import math
+import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -78,7 +88,7 @@ def cmd_play(arg):
     f = playable(path)
     vol = max(0.0, min(1.0, float(cfg.get("volume", 0.7))))
     spawn(f, name, SINK, vol)
-    if cfg.get("monitor", True):
+    if cfg.get("monitor", False):
         spawn(f, name, None, vol)
 
 
@@ -94,6 +104,98 @@ def cmd_stop():
             (PLAYING / str(pid)).unlink()
         except OSError:
             pass
+
+
+# ---- squad callouts -------------------------------------------------------------
+def notify(text):
+    """Small on-screen note (works while you're in a game); silently skipped if notify-send isn't installed."""
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "ToastFX", "-t", "1200", "-h",
+                        "string:x-canonical-private-synchronous:toastfx-callout", "ToastFX", text],
+                       stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
+
+
+def debounced(slot):
+    """True if this slot fired within CALLOUT_DEBOUNCE seconds: swallows key-repeat and double presses."""
+    RUN.mkdir(parents=True, exist_ok=True)
+    mark = RUN / f"toastfx-callout-{slot}.last"
+    now = time.time()
+    try:
+        if now - float(mark.read_text()) < CALLOUT_DEBOUNCE:
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        mark.write_text(repr(now))
+    except OSError:
+        pass
+    return False
+
+
+def valid_wav(path):
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() > 0 and w.getframerate() > 0
+    except (wave.Error, EOFError, OSError):
+        return False
+
+
+def cmd_callout(slot):
+    if slot not in CALLOUT_IDS:
+        die(f"unknown callout '{slot}' (use: {', '.join(CALLOUT_IDS)})")
+    label = CALLOUT_LABELS[slot]
+    cfg = load_config()
+    co = callouts_cfg(cfg)
+    if not co["enabled"]:
+        notify("Callout soundboard is off")
+        print("toastfx-sfx: callout soundboard is off", file=sys.stderr)
+        return EXIT_OFF
+    sl = co["slots"][slot]
+    if not sl["enabled"]:
+        notify(f"{label} is off")
+        print(f"toastfx-sfx: {label} is off", file=sys.stderr)
+        return EXIT_OFF
+    if debounced(slot):
+        return 0
+    f = callout_file(slot)
+    if f is None or not valid_wav(f):
+        notify(f"{label}: sound unavailable")
+        print(f"toastfx-sfx: {label}: sound file missing or unreadable", file=sys.stderr)
+        return EXIT_MISSING
+    vol = max(0.0, min(1.0, co["volume"] * sl["volume"]))
+    spawn(f, f"callout:{slot}", SINK, vol)              # PipeWire mixes it into the virtual mic with your voice
+    if cfg.get("monitor", False):                        # only to your headphones if you chose "hear it myself"
+        spawn(f, f"callout:{slot}", None, vol)
+    notify(label)
+    return 0
+
+
+def cmd_callouts_status():
+    cfg = load_config()
+    co = callouts_cfg(cfg)
+    print("Callout soundboard:", "ON" if co["enabled"] else "OFF", f"(master volume {co['volume']:.2f})")
+    for sid in CALLOUT_IDS:
+        sl = co["slots"][sid]
+        f = callout_file(sid)
+        key = cfg["hotkeys"].get("callout:" + sid, "-")
+        print(f"  {sid:<12} {'on ' if sl['enabled'] else 'off'} vol {sl['volume']:.2f}  key {key:<14} "
+              f"{'custom' if callout_is_custom(sid) else 'shipped'}  {f if f else 'MISSING'}")
+
+
+def cmd_callouts_switch(on):
+    cfg = load_config()
+    callouts_cfg(cfg)["enabled"] = on
+    save_config(cfg)
+    print("callout soundboard", "on" if on else "off")
+
+
+def cmd_replace(slot, src):
+    if slot not in CALLOUT_IDS:
+        die(f"unknown callout '{slot}'")
+    err = import_wav(src, CALLOUT_DIR / f"{slot}.wav")
+    if err:
+        die(f"could not use that file: {err}")
+    print(f"{CALLOUT_LABELS[slot]} now uses {src}")
 
 
 def tone(path, freq, secs=2.0):
@@ -144,6 +246,17 @@ def main(argv):
         print("added", name)
     elif cmd == "test":
         cmd_test()
+    elif cmd == "callout" and len(argv) >= 3:
+        return cmd_callout(argv[2])
+    elif cmd == "callouts":
+        cmd_callouts_status()
+    elif cmd in ("callouts-on", "callouts-off"):
+        cmd_callouts_switch(cmd == "callouts-on")
+    elif cmd == "callout-replace" and len(argv) >= 4:
+        cmd_replace(argv[2], argv[3])
+    elif cmd == "callout-reset" and len(argv) >= 3:
+        callout_reset(argv[2])
+        print("reset", argv[2])
     else:
         print(__doc__)
         return 1

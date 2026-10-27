@@ -5,6 +5,7 @@ Real-time voice changer and soundboard for Linux (PipeWire), built for games and
 - Voice effects: **Dry Mic**, **Radio** (wartime tinny), **Helmet Comms** (squad comms), **Robot**
 - Live **Quick Tweaks** sliders: Radio Filter, Helmet Filter, Dry/Wet Mix
 - **Soundboard** that mixes into your mic through PipeWire (mp3, wav, ogg, flac, m4a ...)
+- **Squad callouts**: four radio cues (Comms Check, Acknowledge, Incoming, Disconnect) with their own keys, volumes and on/off, replaceable with your own WAV. See `docs/CALLOUTS.md`
 - **Global hotkeys** for every voice and sound (X11), with key badges on each button
 - One window, one `.deb`
 
@@ -56,6 +57,10 @@ Needs: `pipewire`, `pipewire-bin` (pw-play, pw-loopback), `pulseaudio-utils` (pa
 - Click a key badge, press a combo to set it; Esc cancels, Backspace clears. Right-click a sound for more.
 - A bare key is only allowed for F13-F24, keypad and media keys, so normal typing and games keep working.
 
+## Squad callouts
+
+Open the **Callouts** tab. Nothing is bound until you set a key. Full details, WAV limits and the clipping note: [docs/CALLOUTS.md](docs/CALLOUTS.md). Run the tests with `python3 -m unittest discover -s tests`.
+
 ## Windows (experimental proof)
 
 `windows/` has a tiny Python proof (mic -> effect -> VB-Cable). See `windows/README.md`.
@@ -70,7 +75,8 @@ Needs: `pipewire`, `pipewire-bin` (pw-play, pw-loopback), `pulseaudio-utils` (pa
 | `systemd/` | user service examples |
 | `windows/` | Windows proof of concept |
 | `tools/` | scripts used to cut the artwork into `ui/assets` |
-| `docs/` | how it fits together |
+| `docs/` | how it fits together, callouts |
+| `tests/` | automated tests |
 
 ## License
 

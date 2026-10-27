@@ -61,7 +61,42 @@ flat(S, 1074, 903, 1216, 964, (15, 16, 19))                       # hint text
 # Quick Tweaks: clear the three slider tracks + percentages so they can be drawn live
 for cy in (271, 342, 412):
     rowfill(S, 1278, cy - 15, 1510, cy + 15, 1270, 1274)
-skin = Image.fromarray(S.astype(np.uint8))
+
+# --- wording changes: wipe the old text, new text is drawn below ---
+rowfill(S, 100, 456, 228, 492, 94, 98)                     # "OUTPUT"
+flat(S, 1012, 455, 1170, 492, (17, 17, 19), noise=0.8)      # "ToastFX Mic" + dropdown arrow
+rowfill(S, 134, 912, 258, 962, 126, 130)                   # "Stop all"
+rowfill(S, 1280, 232, 1480, 258, 1270, 1274)               # "Radio Filter"
+rowfill(S, 1280, 303, 1480, 329, 1270, 1274)               # "Helmet Filter"
+skin = Image.fromarray(S.astype(np.uint8)).convert("RGBA")
+
+
+def overlay(draw_fn, box):
+    """Draw new text with the UI's own font code (design pixels, 1:1) onto the skin."""
+    import sys as _s
+    for cand in (Path(__file__).resolve().parent / "pkg", Path(__file__).resolve().parent.parent / "ui"):
+        if (cand / "toastfx_ui.py").exists():
+            _s.path.insert(0, str(cand))
+    import toastfx_ui as U
+    U.set_scale(1.0)
+    cv = U.Cv(box[2] - box[0], box[3] - box[1])
+    draw_fn(cv)
+    skin.alpha_composite(cv.done(), dest=(box[0], box[1]))
+
+
+def spaced(cv, x, y, text, size, color, gap):
+    for ch in text:
+        cv.text((x, y), ch, size, color, anchor="lm")
+        x += cv.tw(ch, size) + gap
+
+
+overlay(lambda cv: spaced(cv, 5, 18, "MIC LEVEL", 18, (255, 214, 150, 255), 1.2), (104, 457, 230, 493))
+overlay(lambda cv: cv.text((12, 18), "ToastFX Mic", 21, (232, 224, 214, 255), bold=False, anchor="lm"), (1012, 457, 1170, 493))
+overlay(lambda cv: (cv.text((63, 25), "Stop sounds", 28, (150, 52, 8, 110), maxw=124, anchor="mm"),
+                    cv.text((62, 24), "Stop sounds", 28, (255, 255, 255, 255), maxw=124, anchor="mm")), (134, 912, 258, 962))
+overlay(lambda cv: cv.text((3, 12), "Radio Strength", 17, (240, 232, 222, 255), bold=False, anchor="lm"), (1280, 232, 1480, 258))
+overlay(lambda cv: cv.text((3, 12), "Helmet Strength", 17, (240, 232, 222, 255), bold=False, anchor="lm"), (1280, 303, 1480, 329))
+skin = skin.convert("RGB")
 skin.save(OUT / "skin.png")
 
 

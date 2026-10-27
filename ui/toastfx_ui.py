@@ -40,14 +40,14 @@ HINT = (1078, 905, 1216, 964)
 PAGER = (1020, 524, 1160, 556)
 STOPALL = (33, 893, 268, 975)
 SOON_AT = (1440, 184)
-TW_X0, TW_X1, TW_PCT_X = 1282, 1460, 1474
+TW_X0, TW_X1, TW_PCT_X = 1282, 1424, 1452
 TW_Y = (271, 342, 412)          # centre line of the Radio / Helmet / Mix rows
 
 # id, title, subtitle, icon, (gradient top, bottom) when idle, icon tint when idle (None = keep colours)
 VOICES = [
     ("dry", "Dry Mic", "(clean voice)", "v_mic", ((66, 60, 56), (44, 40, 38)), (236, 214, 190)),
-    ("radio", "Radio", "(classic filter)", "v_radio", ((60, 65, 86), (42, 46, 64)), (236, 212, 190)),
-    ("helmet", "Helmet Comms", "(crisp & bassy)", "v_helmet_line", ((74, 60, 46), (48, 40, 32)), (236, 214, 190)),
+    ("radio", "Radio", "(wartime tinny)", "v_radio", ((60, 65, 86), (42, 46, 64)), (236, 212, 190)),
+    ("helmet", "Helmet Comms", "(squad comms)", "v_helmet_line", ((74, 60, 46), (48, 40, 32)), (236, 214, 190)),
     ("robot", "Robot", "(beep boop)", "v_robot", ((54, 86, 120), (38, 62, 90)), (126, 190, 235)),
 ]
 SOUND_ICONS = ["burst", "note", "chick", "flame", "cat", "pizza", "beer"]
@@ -470,6 +470,167 @@ def soon_chip():
     cv.stroke_rr((0, 0, 66, 28), 10, (245, 154, 42, 200), 1.5)
     cv.text((33, 15), "SOON", 14, ORANGE_L, maxw=58)
     return cv.done(), SOON_AT
+
+
+# ---- squad callouts view ---------------------------------------------------------------
+TABS = (760, 524, 1000, 556)                  # "Sounds | Callouts" switch, left of the pager
+SL_X0, SL_X1, SL_DY = 104, 178, 94            # per-callout volume slider inside a tile (tile-relative)
+SW_X, SW_Y, SW_W, SW_H = 212, 68, 41, 22      # per-callout on/off switch inside a tile (tile-relative)
+ROW2_Y = TILE_Y0 + TILE_SY
+CO_MASTER = (TILE_X0, ROW2_Y, TILE_X0 + TILE_W, ROW2_Y + TILE_H)
+CO_VOL = (TILE_X0 + TILE_SX, ROW2_Y, TILE_X0 + 2 * TILE_SX + TILE_W, ROW2_Y + TILE_H)
+CO_VX0, CO_VX1, CO_VY = CO_VOL[0] + 30, CO_VOL[2] - 110, ROW2_Y + 70
+CO_INFO = (TILE_X0 + 3 * TILE_SX, ROW2_Y, TILE_X0 + 3 * TILE_SX + TILE_W, ROW2_Y + TILE_H)
+CO_SWITCH = (CO_MASTER[2] - 12 - 56, ROW2_Y + 62, CO_MASTER[2] - 12, ROW2_Y + 62 + 28)
+
+
+def slot_switch_rect(slot):
+    x, y = tile_pos(slot)
+    return (x + SW_X - 4, y + SW_Y - 4, x + SW_X + SW_W + 4, y + SW_Y + SW_H + 4)
+
+
+def slot_slider_rect(slot):
+    x, y = tile_pos(slot)
+    return (x + SL_X0 - 14, y + SL_DY - 12, x + SL_X1 + 14, y + SL_DY + 12)
+
+
+def _glyph(cv, kind, cx, cy, color, w=4):
+    """Four hand-drawn cue symbols, 44 px square, centred on cx, cy."""
+    im, d = cv.layer()
+    S = cv.s
+    c = tuple(color)
+    ln = lambda pts: d.line([(S(cx + x), S(cy + y)) for x, y in pts], fill=c, width=max(1, S(w)), joint="curve")
+    if kind == "comms_check":                                   # signal bars
+        for i, hgt in enumerate((10, 20, 30)):
+            x = -15 + i * 15
+            d.rounded_rectangle([S(cx + x - 4), S(cy + 15 - hgt), S(cx + x + 4), S(cy + 15)], S(2), fill=c)
+    elif kind == "ack":                                         # tick
+        ln([(-16, 2), (-5, 13), (17, -13)])
+    elif kind == "incoming":                                    # arrow into a tray
+        ln([(0, -18), (0, 7)])
+        ln([(-10, -3), (0, 8), (10, -3)])
+        ln([(-16, 14), (16, 14)])
+    else:                                                       # disconnect: radio arcs, struck through
+        d.ellipse([S(cx - 3), S(cy + 8), S(cx + 3), S(cy + 14)], fill=c)
+        for r in (12, 22):
+            d.arc([S(cx - r), S(cy + 11 - r), S(cx + r), S(cy + 11 + r)], 225, 315, fill=c, width=max(1, S(w)))
+        ln([(-19, -16), (19, 18)])
+    cv.img.alpha_composite(im)
+
+
+def _switch(cv, x, y, w, h, on, dim=False):
+    if on and not dim:
+        cv.glow_rr((x, y, x + w, y + h), h / 2, (255, 150, 30, 130), 4)
+        cv.fill_rr((x, y, x + w, y + h), h / 2, (255, 178, 70), (240, 128, 30))
+        kx = x + w - h / 2
+    else:
+        cv.fill_rr((x, y, x + w, y + h), h / 2, (84, 82, 88), (66, 64, 70))
+        kx = x + h / 2
+    r = h / 2 - 2.5
+    cv.fill_rr((kx - r, y + h / 2 - r, kx + r, y + h / 2 + r), r, (255, 252, 246), (236, 230, 220))
+
+
+def _mini_slider(cv, x0, x1, y, value, on=True):
+    cv.fill_rr((x0, y - 3, x1, y + 3), 3, (50, 48, 52), (62, 60, 64))
+    fx = x0 + (x1 - x0) * max(0.0, min(1.0, value))
+    if value > 0:
+        cv.fill_rr((x0, y - 3, fx, y + 3), 3, (255, 190, 84) if on else (130, 124, 118),
+                   (243, 140, 36) if on else (110, 104, 100), horizontal=True)
+    cv.fill_rr((fx - 7, y - 7, fx + 7, y + 7), 7, (255, 250, 240), (232, 226, 214))
+    cv.stroke_rr((fx - 7, y - 7, fx + 7, y + 7), 7, ((243, 150, 40, 255) if on else (140, 134, 128, 255)), 2)
+
+
+def tabs(view, hover=None):
+    w, h = TABS[2] - TABS[0], TABS[3] - TABS[1]
+    cv = Cv(w, h)
+    half = w / 2
+    for i, (vid, label) in enumerate((("board", "Sounds"), ("callouts", "Callouts"))):
+        b = (i * half + 2, 0, (i + 1) * half - 2, h)
+        if view == vid:
+            cv.fill_rr(b, 12, (255, 178, 70), (240, 128, 30))
+            col = DARK
+        else:
+            lit = hover == vid
+            cv.fill_rr(b, 12, (56, 58, 70) if lit else (46, 48, 58), (46, 48, 58) if lit else (38, 40, 49))
+            cv.stroke_rr(b, 12, (255, 255, 255, 30), 1.4)
+            col = CREAM
+        cv.text(((b[0] + b[2]) / 2, h / 2 + 1), label, 18, col)
+    return cv.done(), (TABS[0], TABS[1])
+
+
+def callout_tile(slot, sid, name, state, key_text, key_kind, vol, enabled, hover=False):
+    """state: 'on' | 'off' | 'playing' | 'unavailable'."""
+    pad = 20
+    cv = Cv(TILE_W + 2 * pad, TILE_H + 2 * pad)
+    b = (pad, pad, pad + TILE_W, pad + TILE_H)
+    playing, dead = state == "playing", state in ("off", "unavailable")
+    if playing:
+        cv.glow_rr(b, 20, (255, 140, 30, 220), 12, grow=2)
+        cv.fill_rr(b, 20, (46, 38, 32), (34, 29, 27))
+        cv.stroke_rr(b, 20, (255, 178, 64, 255), 4)
+    else:
+        cv.glow_rr((b[0], b[1] + 6, b[2], b[3] + 6), 20, (0, 0, 0, 140), 7)
+        top, bot = ((50, 54, 68), (38, 41, 53)) if hover and not dead else ((43, 46, 58), (34, 37, 47))
+        if dead:
+            top, bot = (38, 39, 46), (31, 32, 38)
+        cv.fill_rr(b, 20, top, bot)
+        cv.stroke_rr(b, 20, (255, 255, 255, 34), 2)
+    gc = (255, 122, 48) if playing else (ORANGE_L if not dead else (118, 118, 130))
+    cv.fill_rr((pad + 24, pad + 28, pad + 80, pad + 84), 28, (24, 24, 30), (24, 24, 30))
+    _glyph(cv, sid, pad + 52, pad + 56, gc)
+    size, label = 24, name
+    while cv.tw(label, size) > 150 and size > 15:
+        size -= 1
+    cv.text((pad + SL_X0, pad + 52), label, size, (233, 233, 242) if not dead else (150, 150, 162), anchor="lm")
+    st = {"on": ("READY", (126, 224, 82)), "off": ("OFF", (150, 150, 162)), "playing": ("PLAYING", (255, 122, 48)),
+          "unavailable": ("NO SOUND FILE", WARN)}[state]
+    cv.text((pad + SL_X0, pad + SW_Y + SW_H / 2), st[0], 15, st[1], anchor="lm", maxw=104)
+    _switch(cv, pad + SW_X, pad + SW_Y, SW_W, SW_H, enabled)
+    _mini_slider(cv, pad + SL_X0, pad + SL_X1, pad + SL_DY, vol, on=not dead)
+    cv.text((pad + SL_X1 + 22, pad + SL_DY), f"{int(round(vol * 100))}%", 14, DIM, bold=False, anchor="lm")
+    bd = badge(cv, pad + TILE_W - 12, pad + 12, key_text, key_kind)
+    x, y = tile_pos(slot)
+    return cv.done(), (x - pad, y - pad), (x - pad + bd[0], y - pad + bd[1], x - pad + bd[2], y - pad + bd[3])
+
+
+def _panel(cv, b, hover=False):
+    cv.glow_rr((b[0], b[1] + 6, b[2], b[3] + 6), 20, (0, 0, 0, 140), 7)
+    cv.fill_rr(b, 20, (43, 46, 58), (34, 37, 47))
+    cv.stroke_rr(b, 20, (255, 255, 255, 34), 2)
+
+
+def co_master(on, hover=False):
+    pad = 20
+    w, h = CO_MASTER[2] - CO_MASTER[0], CO_MASTER[3] - CO_MASTER[1]
+    cv = Cv(w + 2 * pad, h + 2 * pad)
+    b = (pad, pad, pad + w, pad + h)
+    _panel(cv, b)
+    cv.text((pad + 22, pad + 34), "Callout soundboard", 22, (233, 233, 242), anchor="lm", maxw=w - 44)
+    cv.text((pad + 22, pad + 76), "ALL CUES " + ("ON" if on else "OFF"), 17,
+            (126, 224, 82) if on else (150, 150, 162), anchor="lm")
+    _switch(cv, pad + w - 12 - 56, pad + 62, 56, 28, on)
+    return cv.done(), (CO_MASTER[0] - pad, CO_MASTER[1] - pad)
+
+
+def co_volume(value, on, active=False):
+    pad = 20
+    w, h = CO_VOL[2] - CO_VOL[0], CO_VOL[3] - CO_VOL[1]
+    cv = Cv(w + 2 * pad, h + 2 * pad)
+    _panel(cv, (pad, pad, pad + w, pad + h))
+    cv.text((pad + 30, pad + 32), "Master callout volume", 22, (233, 233, 242) if on else (150, 150, 162), anchor="lm")
+    cv.text((pad + 30, pad + 56), "Each cue also has its own slider", 14, DIM, bold=False, anchor="lm")
+    x0, x1, y = CO_VX0 - CO_VOL[0] + pad, CO_VX1 - CO_VOL[0] + pad, CO_VY - CO_VOL[1] + pad
+    _mini_slider(cv, x0, x1, y, value, on=on)
+    cv.text((x1 + 22, y), f"{int(round(value * 100))}%", 21, CREAM, bold=False, anchor="lm")
+    return cv.done(), (CO_VOL[0] - pad, CO_VOL[1] - pad)
+
+
+def co_info():
+    w, h = CO_INFO[2] - CO_INFO[0], CO_INFO[3] - CO_INFO[1]
+    cv = Cv(w, h)
+    for i, ln in enumerate(("Click a cue to test it", "Right-click: your own WAV", "Stop sounds also stops cues")):
+        cv.text((6, 22 + i * 28), ln, 16, DIM, bold=False, anchor="lm", maxw=w - 8)
+    return cv.done(), (CO_INFO[0], CO_INFO[1])
 
 
 def load_skin():

@@ -15,15 +15,16 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import toastfx_ui as U
 from toastfx_core import *
 
 DESIGN_W, DESIGN_H = 1536, 1024
 TILE_NAMES = [f"tile{i}" for i in range(PER_PAGE)]
-Z_ORDER = ["pill", "ebtn", "card0", "card1", "card2", "card3", "meter"] + TILE_NAMES + \
-          ["pager", "hotkeys", "tw0", "tw1", "tw2", "volume", "percent", "toggle", "hint"]
+CO_NAMES = [f"co{i}" for i in range(len(CALLOUT_IDS))] + ["comaster", "covol", "coinfo"]
+Z_ORDER = ["pill", "ebtn", "card0", "card1", "card2", "card3", "meter"] + TILE_NAMES + CO_NAMES + \
+          ["tabs", "pager", "hotkeys", "tw0", "tw1", "tw2", "volume", "percent", "toggle", "hint"]
 
 
 class App:
@@ -84,6 +85,9 @@ class App:
         self.core.start_listener()
         self.refresh()
         root.after(120, self.tick)
+        self.meter_imgs, self.meter_step = {}, -1
+        if not self.flat:
+            root.after(33, self.meter_tick)
 
     # ---- drawing -----------------------------------------------------------------------
     def place(self, name, key, render):
@@ -161,10 +165,22 @@ class App:
             self.hits.append(((x, y, x + U.CARD_W, y + U.CARD_H), "voice", vid))
 
         # meter
-        self.place("meter", ("meter", int(core.level * 40)), lambda: U.meter(core.level))
+        if self.flat:
+            self.place("meter", ("meter", int(core.level * 40)), lambda: U.meter(core.level))
 
-        # soundboard
-        shown = core.page_items()
+        # soundboard / callouts
+        hv_tab = hov[1] if hov and hov[0] == "tab" else None
+        self.place("tabs", ("tabs", core.view, hv_tab), lambda: U.tabs(core.view, hv_tab))
+        tx0, ty0, tx1, ty1 = U.TABS
+        self.hits.append(((tx0, ty0, (tx0 + tx1) / 2, ty1), "tab", "board"))
+        self.hits.append((((tx0 + tx1) / 2, ty0, tx1, ty1), "tab", "callouts"))
+        if core.view == "callouts":
+            self.refresh_callouts(hov)
+            shown = []
+        else:
+            for n in CO_NAMES:
+                self.hide(n)
+            shown = core.page_items()
         used = set()
         for slot, snd in shown:
             name = TILE_NAMES[slot]
@@ -192,7 +208,7 @@ class App:
 
         # pager
         pages = core.pages()
-        if pages > 1:
+        if pages > 1 and core.view == "board":
             hp = hov[1] if hov and hov[0] == "pager" else None
             self.place("pager", ("pager", core.page, pages, hp), lambda: U.pager(core.page, pages, hp))
             x0, y0, x1, y1 = U.PAGER
@@ -214,7 +230,7 @@ class App:
         vol = round(core.cfg["volume"], 2)
         self.place("volume", ("volume", vol), lambda: U.volume(vol))
         self.place("percent", ("percent", vol), lambda: U.percent(vol))
-        mon = bool(core.cfg.get("monitor", True))
+        mon = bool(core.cfg.get("monitor", False))
         self.place("toggle", ("toggle", mon), lambda: U.toggle(mon))
         lines, warn = core.hint()
         self.place("hint", ("hint", tuple(lines), warn), lambda: U.hint(lines, U.WARN if warn else U.DIM))
@@ -223,6 +239,32 @@ class App:
         self.hits.append(((U.VOL_X0 - 18, U.VOL_Y - 24, U.VOL_X1 + 18, U.VOL_Y + 24), "volume", None))
         self.hits.append((U.HINT, "hint", None))
         self.flush_flat()
+
+    def refresh_callouts(self, hov):
+        core = self.core
+        on = core.co_on()
+        for i, sid in enumerate(CALLOUT_IDS):
+            target = "callout:" + sid
+            kt, kk = core.key_text(target)
+            state = core.slot_state(sid)
+            sl = core.slot(sid)
+            hv = hov == ("callout", sid)
+            name = f"co{i}"
+            self.place(name, ("co", sid, state, sl["enabled"], round(sl["volume"], 2), hv, kt, kk),
+                       lambda i=i, sid=sid, state=state, sl=sl, hv=hv, kt=kt, kk=kk:
+                       U.callout_tile(i, sid, CALLOUT_SHORT[sid], state, kt, kk, sl["volume"], sl["enabled"], hv))
+            self.hits.append((self.brects.get(name, (0, 0, 0, 0)), "badge", target))
+            self.hits.append((U.slot_switch_rect(i), "co_switch", sid))
+            self.hits.append((U.slot_slider_rect(i), "co_slider", sid))
+            x, y = U.tile_pos(i)
+            self.hits.append(((x, y, x + U.TILE_W, y + U.TILE_H), "callout", sid))
+        vol = round(core.co()["volume"], 2)
+        self.place("comaster", ("comaster", on), lambda: U.co_master(on))
+        self.hits.append((U.CO_SWITCH, "co_master", None))
+        self.hits.append((U.CO_MASTER, "co_master", None))
+        self.place("covol", ("covol", vol, on), lambda: U.co_volume(vol, on))
+        self.hits.append(((U.CO_VX0 - 16, U.CO_VY - 14, U.CO_VX1 + 16, U.CO_VY + 14), "co_vol", None))
+        self.place("coinfo", ("coinfo",), U.co_info)
 
     # ---- events ------------------------------------------------------------------------
     def design_xy(self, e):
@@ -244,7 +286,7 @@ class App:
         if self.drag:
             return
         h = self.hit(*self.design_xy(e))
-        if h and h[0] in ("voice", "sound", "add", "engine", "pager"):
+        if h and h[0] in ("voice", "sound", "add", "engine", "pager", "tab", "callout"):
             self.set_hover(h)
         else:
             self.set_hover(None)
@@ -267,6 +309,20 @@ class App:
             core.begin_listen(p) if core.listening != p else core.end_listen()
         elif kind == "add":
             self.add_sound()
+        elif kind == "tab":
+            core.set_view(p)
+        elif kind == "callout":
+            core.play_callout(p)
+        elif kind == "co_switch":
+            core.toggle_slot(p)
+        elif kind == "co_master":
+            core.toggle_callouts()
+        elif kind == "co_slider":
+            self.drag = ("slot", p)
+            self.set_co_vol(p, self.design_xy(e)[0])
+        elif kind == "co_vol":
+            self.drag = ("master", None)
+            self.set_co_vol(None, self.design_xy(e)[0])
         elif kind == "pager":
             core.turn_page(-1 if p == "prev" else 1)
         elif kind == "stopall":
@@ -294,10 +350,26 @@ class App:
         v = (dx - U.TW_X0) / (U.TW_X1 - U.TW_X0)
         self.core.set_tweak(self.core.TWEAKS[i], v, save=save)
 
+    def set_co_vol(self, sid, dx, save=False):
+        if sid is None:
+            v = (dx - U.CO_VX0) / (U.CO_VX1 - U.CO_VX0)
+        else:
+            i = CALLOUT_IDS.index(sid)
+            v = (dx - (U.tile_pos(i)[0] + U.SL_X0)) / (U.SL_X1 - U.SL_X0)
+        self.core.set_co_volume(v, sid, save=save)
+
+    def drag_to(self, kind, dx, save=False):
+        if kind[0] == "tweak":
+            self.set_tweak(kind[1], dx, save)
+        elif kind[0] == "slot":
+            self.set_co_vol(kind[1], dx, save)
+        else:
+            self.set_co_vol(None, dx, save)
+
     def on_drag(self, e):
         if self.drag:
             if isinstance(self.drag, tuple):
-                self.set_tweak(self.drag[1], self.design_xy(e)[0])
+                self.drag_to(self.drag, self.design_xy(e)[0])
             else:
                 self.set_volume(self.design_xy(e)[0])
             self.refresh()
@@ -306,13 +378,16 @@ class App:
         if self.drag:
             kind, self.drag = self.drag, False
             if isinstance(kind, tuple):
-                self.set_tweak(kind[1], self.design_xy(e)[0], save=True)
+                self.drag_to(kind, self.design_xy(e)[0], save=True)
             else:
                 self.set_volume(self.design_xy(e)[0], save=True)
             self.refresh()
 
     def on_right_click(self, e):
         h = self.hit(*self.design_xy(e))
+        if h and (h[0] in ("callout", "co_switch", "co_slider") or (h[0] == "badge" and h[1].startswith("callout:"))):
+            sid = h[1][len("callout:"):] if h[0] == "badge" else h[1]
+            return self.callout_menu(e, sid)
         if not h or h[0] not in ("sound", "badge") or (h[0] == "badge" and not h[1].startswith("sound:")):
             return
         name = h[1] if h[0] == "sound" else h[1][len("sound:"):]
@@ -322,12 +397,59 @@ class App:
         m.add_command(label=f"Play “{name}”", command=lambda: self.core.play(name))
         m.add_command(label="Set hotkey…", command=lambda: (self.core.begin_listen(target), self.refresh()))
         m.add_command(label="Clear hotkey", command=lambda: (self.core.clear(target), self.refresh()))
+        m.add_command(label="Rename…", command=lambda: self.rename(name))
         m.add_separator()
         m.add_command(label="Remove from board", command=lambda: self.remove(name))
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
+
+    def callout_menu(self, e, sid):
+        core = self.core
+        target = "callout:" + sid
+        m = self.menu
+        m.delete(0, "end")
+        m.add_command(label=f"Test “{CALLOUT_LABELS[sid]}”", command=lambda: core.play_callout(sid))
+        m.add_command(label="Set hotkey…", command=lambda: (core.begin_listen(target), self.refresh()))
+        m.add_command(label="Clear hotkey", command=lambda: (core.clear(target), self.refresh()))
+        m.add_separator()
+        m.add_command(label="Volume…", command=lambda: self.ask_volume(sid))
+        m.add_command(label="Turn off" if core.slot(sid)["enabled"] else "Turn on",
+                      command=lambda: (core.toggle_slot(sid), self.refresh()))
+        m.add_separator()
+        m.add_command(label="Replace with my WAV…", command=lambda: self.replace_callout(sid))
+        m.add_command(label="Back to the default sound", command=lambda: (core.reset_slot(sid), self.refresh()),
+                      state="normal" if callout_is_custom(sid) else "disabled")
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def ask_volume(self, sid):
+        cur = round(self.core.slot(sid)["volume"] * 100)
+        v = simpledialog.askinteger("Volume", f"{CALLOUT_LABELS[sid]} volume (0-100):", initialvalue=cur,
+                                    minvalue=0, maxvalue=100, parent=self.root)
+        if v is not None:
+            self.core.set_co_volume(v / 100.0, sid, save=True)
+            self.refresh()
+
+    def replace_callout(self, sid):
+        path = filedialog.askopenfilename(
+            title=f"Pick a WAV for “{CALLOUT_LABELS[sid]}”",
+            filetypes=[("WAV audio (up to 15 s)", "*.wav"), ("All files", "*.*")])
+        if path:
+            self.core.replace_slot(sid, path)
+            self.refresh()
+
+    def rename(self, name):
+        new = simpledialog.askstring("Rename sound", "New name:", initialvalue=name, parent=self.root)
+        if new is None:
+            return
+        err = self.core.rename_sound(name, new)
+        if err:
+            messagebox.showinfo("Rename sound", err)
+        self.refresh()
 
     def remove(self, name):
         if messagebox.askyesno("Remove sound", f"Remove “{name}” from the board?\n(The file itself is not deleted.)"):
@@ -366,6 +488,24 @@ class App:
             except Exception:
                 pass
             time.sleep(1.0)
+
+    METER_STEPS = 48
+
+    def meter_tick(self):
+        """The level bar is redrawn from a small set of pre-made pictures, about 30 times a second."""
+        try:
+            step = int(round(max(0.0, min(1.0, self.core.level)) * self.METER_STEPS))
+            if step != self.meter_step:
+                self.meter_step = step
+                ent = self.meter_imgs.get(step)
+                if ent is None:
+                    img, pos = U.meter(step / self.METER_STEPS)
+                    ent = (tk.PhotoImage(data=U.png_b64(img)), (round(pos[0] * self.sc), round(pos[1] * self.sc)))
+                    self.meter_imgs[step] = ent
+                self.canvas.itemconfigure(self.ids["meter"], image=ent[0], state="normal")
+                self.canvas.coords(self.ids["meter"], *ent[1])
+        finally:
+            self.root.after(33, self.meter_tick)
 
     def tick(self):
         try:
